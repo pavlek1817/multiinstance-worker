@@ -10,10 +10,12 @@ public sealed class LeasedWorkerHostedService(
     ILogger<LeasedWorkerHostedService> logger,
     ILeaseManager leaseManager,
     IInstanceIdentityProvider instanceIdentityProvider,
+    IInstanceRegistry instanceRegistry,
     string workloadKey,
     string displayName,
     TimeSpan leaseTtl,
     TimeSpan renewInterval,
+    TimeSpan drainTimeout,
     Func<CancellationToken, Task> executeAsync)
     : BackgroundService
 {
@@ -21,10 +23,12 @@ public sealed class LeasedWorkerHostedService(
         logger,
         leaseManager,
         instanceIdentityProvider,
+        instanceRegistry,
         workloadKey,
         displayName,
         leaseTtl,
         renewInterval,
+        drainTimeout,
         executeAsync);
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken) => this.runner.RunAsync(stoppingToken);

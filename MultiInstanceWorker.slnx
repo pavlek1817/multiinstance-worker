@@ -2,7 +2,11 @@
   <Folder Name="/src/">
     <Project Path="src/MultiInstanceWorker/MultiInstanceWorker.csproj" />
   </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/MultiInstanceWorker.Sample.Api/MultiInstanceWorker.Sample.Api.csproj" />
+  </Folder>
   <Folder Name="/test/">
     <Project Path="test/MultiInstanceWorker.Tests/MultiInstanceWorker.Tests.csproj" />
+    <Project Path="test/MultiInstanceWorker.FunctionalTests/MultiInstanceWorker.FunctionalTests.csproj" />
   </Folder>
 </Solution>
