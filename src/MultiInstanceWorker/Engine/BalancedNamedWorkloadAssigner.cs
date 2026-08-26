@@ -1,0 +1,47 @@
+namespace MultiInstanceWorker;
+
+/// <summary>
+/// Splits a set of named workloads evenly across the active instances, by sort order.
+/// </summary>
+public sealed class BalancedNamedWorkloadAssigner
+{
+    /// <summary>
+    /// Returns the slice of <paramref name="workloads"/> assigned to <paramref name="currentInstanceId"/>.
+    /// </summary>
+    public IReadOnlyCollection<TWorkload> GetAssignedWorkloads<TWorkload>(
+        IEnumerable<TWorkload> workloads,
+        Func<TWorkload, string> keySelector,
+        IEnumerable<string> activeInstanceIds,
+        string currentInstanceId)
+    {
+        var orderedInstances = activeInstanceIds
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(x => x, StringComparer.Ordinal)
+            .ToArray();
+
+        var currentIndex = Array.IndexOf(orderedInstances, currentInstanceId);
+        if (currentIndex < 0)
+        {
+            return Array.Empty<TWorkload>();
+        }
+
+        var orderedWorkloads = workloads
+            .OrderBy(keySelector, StringComparer.Ordinal)
+            .ToArray();
+
+        if (orderedWorkloads.Length == 0)
+        {
+            return Array.Empty<TWorkload>();
+        }
+
+        var baseWorkloadCount = orderedWorkloads.Length / orderedInstances.Length;
+        var remainder = orderedWorkloads.Length % orderedInstances.Length;
+        var assignedCount = baseWorkloadCount + (currentIndex < remainder ? 1 : 0);
+        var startIndex = (currentIndex * baseWorkloadCount) + Math.Min(currentIndex, remainder);
+
+        return orderedWorkloads
+            .Skip(startIndex)
+            .Take(assignedCount)
+            .ToArray();
+    }
+}

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MultiInstanceWorker/MultiInstanceWorker.csproj" />
+  </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/MultiInstanceWorker.Tests/MultiInstanceWorker.Tests.csproj" />
+  </Folder>
+</Solution>
