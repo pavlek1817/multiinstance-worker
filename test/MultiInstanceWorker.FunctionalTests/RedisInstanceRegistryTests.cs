@@ -1,6 +1,5 @@
 using FluentAssertions;
 using Microsoft.Extensions.Options;
-using MultiInstanceWorker;
 using MultiInstanceWorker.Sample.Api.Redis;
 using StackExchange.Redis;
 

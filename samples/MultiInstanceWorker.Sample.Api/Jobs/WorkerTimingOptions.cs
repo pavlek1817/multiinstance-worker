@@ -1,5 +1,3 @@
-using MultiInstanceWorker;
-
 namespace MultiInstanceWorker.Sample.Api.Jobs;
 
 /// <summary>

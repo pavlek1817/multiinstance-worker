@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Options;
-using MultiInstanceWorker;
 using StackExchange.Redis;
 
 namespace MultiInstanceWorker.Sample.Api.Redis;

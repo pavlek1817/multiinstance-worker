@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Options;
-using MultiInstanceWorker;
 
 namespace MultiInstanceWorker.Sample.Api.Jobs;
 
