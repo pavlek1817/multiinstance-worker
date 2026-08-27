@@ -50,15 +50,38 @@ A consumer's `ILeaseManager` implementation protects each named workload with mu
 
 1. tries to acquire or renew the lease
 2. starts the worker only when the lease is owned
-3. switches into drain mode on shutdown (or whenever `IInstanceRegistry.IsDraining` becomes true for any other reason)
+3. switches into drain mode on shutdown (or whenever `IInstanceRegistry.IsDraining` becomes true for any other reason), calling `RequestDrain()` on the workload's `IDrainableService` (if it supplied one) the moment that happens
 4. lets the current cycle finish, then stops taking new work
 5. releases the lease during shutdown
 
-### Coordinator (consumer-provided)
-For workloads beyond a single singleton, a consumer writes its own coordinator hosted service that keeps heartbeats alive, reads active instances, uses `BalancedNamedWorkloadAssigner` to decide which of its own domain-specific workloads belong to this instance, and starts one `LeasedWorkerRunner` per assigned workload. That coordinator is domain-specific (it knows how to construct and run each workload) and lives in the consuming application, not in this library. A drain-aware coordinator should also: stop reassigning a draining instance's own workloads elsewhere until it actually stops (`GetActiveInstanceIdsAsync` already excludes draining instances for *other* nodes' assignment decisions), and wait for its own runners to reach a safe stopping point during its own shutdown instead of cancelling them outright.
+### Coordinator
+For workloads beyond a single singleton, `WorkloadCoordinatorHostedService<TWorkload>` keeps
+heartbeats alive, reads active instances, uses `BalancedNamedWorkloadAssigner` to decide which
+workloads belong to this instance, and reconciles one `LeasedWorkerRunner` per assigned workload —
+starting runners for newly assigned workloads and stopping ones that dropped out. Each runner gets
+its own `CancellationTokenSource`, independent of the coordinator's host token, and is driven with
+`LeasedWorkerRunner.RunAsync(stoppingToken, shutdownToken)`: the per-runner token as `stoppingToken`
+(cancelled when the coordinator removes just that runner) and the host token as `shutdownToken`
+(cancelled when the whole instance shuts down) — this is what lets one workload being reassigned
+stay a purely local event instead of draining the whole instance.
+
+A workload dropping out of this instance's assignment is handled based on *why* the instance's own
+state changed, not why the workload left:
+- instance draining, runner still running → left alone this tick, same as full shutdown
+- instance draining, runner already finished → cleaned up without cancelling
+- instance not draining (a plain rebalance) → stopped immediately, scoped to that one runner
+
+Workload construction and execution stay entirely in the `executeAsync` delegate a consumer
+supplies (it knows how to construct and run each workload) — that piece is domain-specific and
+lives in the consuming application, not in this library.
 
 ### Draining
 When an instance begins draining — because its host is shutting down, or because something else flips `IInstanceRegistry.IsDraining` ahead of a planned downsize — the backing store should mark that instance's record so other nodes stop assigning new workloads to it (see `GetActiveInstanceIdsAsync`, which excludes draining instances). Each `LeasedWorkerRunner` for that instance keeps its current worker running until it reaches a safe boundary and exits on its own, up to a `drainTimeout` ceiling; only once that ceiling is hit does the runner force-cancel the worker. This is what lets an instance hand its in-flight work over cleanly instead of dropping it when the cluster is downsized.
+
+A workload doesn't have to depend on `IInstanceRegistry` to find out it should wrap up. If it
+implements `IDrainableService`, the runner calls `RequestDrain()` on it the instant drain mode is
+entered — well ahead of `drainTimeout` — so the workload only needs to know "stop after the current
+unit of work", not anything about leases or instance registries.
 
 ## Result
 

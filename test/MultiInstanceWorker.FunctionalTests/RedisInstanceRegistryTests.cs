@@ -4,6 +4,7 @@ using MultiInstanceWorker;
 using MultiInstanceWorker.Sample.Api.Redis;
 using StackExchange.Redis;
 
+
 namespace MultiInstanceWorker.FunctionalTests;
 
 /// <summary>Exercises <see cref="RedisInstanceRegistry"/> directly against a real Redis instance.</summary>

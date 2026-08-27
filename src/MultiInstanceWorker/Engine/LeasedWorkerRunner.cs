@@ -11,7 +11,10 @@ namespace MultiInstanceWorker;
 /// On shutdown (or when <see cref="IInstanceRegistry.IsDraining"/> becomes true for
 /// any other reason, e.g. an operator-triggered drain ahead of downsizing) the runner
 /// stops taking new work but lets an in-flight worker finish on its own, up to
-/// <c>drainTimeout</c>, instead of cancelling it immediately.
+/// <c>drainTimeout</c>, instead of cancelling it immediately. If the workload passed as
+/// <paramref name="drainable"/> implements <see cref="IDrainableService"/>, its
+/// <see cref="IDrainableService.RequestDrain"/> is invoked the moment drain mode is entered, so a
+/// cooperative workload can wrap up on its own well before <c>drainTimeout</c> would force it.
 /// </remarks>
 public sealed class LeasedWorkerRunner(
     ILogger logger,
@@ -23,17 +26,40 @@ public sealed class LeasedWorkerRunner(
     TimeSpan leaseTtl,
     TimeSpan renewInterval,
     TimeSpan drainTimeout,
-    Func<CancellationToken, Task> executeAsync)
+    Func<CancellationToken, Task> executeAsync,
+    IDrainableService? drainable = null)
 {
     /// <summary>
     /// Drives the leader-election loop for the workload.
     /// </summary>
-    public async Task RunAsync(CancellationToken stoppingToken)
+    /// <param name="stoppingToken">
+    /// Signals that <em>this runner</em> should stop (e.g. workload reassigned by a coordinator).
+    /// Cancelling this token exits the loop cleanly but does <b>not</b> mark the whole instance as
+    /// draining — that is the responsibility of <paramref name="shutdownToken"/>.
+    /// </param>
+    /// <param name="shutdownToken">
+    /// Signals that the <em>whole instance</em> is shutting down (e.g. preStop hook or SIGTERM).
+    /// Cancelling this token enters drain mode and calls
+    /// <see cref="IInstanceRegistry.BeginDrainAsync"/> to mark the instance in the backing store.
+    /// For hosted services where there is no per-runner coordinator, pass the same token as both
+    /// <paramref name="stoppingToken"/> and <paramref name="shutdownToken"/>.
+    /// </param>
+    public async Task RunAsync(CancellationToken stoppingToken, CancellationToken shutdownToken)
     {
         Task? workerTask = null;
         CancellationTokenSource? workerTokenSource = null;
         DateTimeOffset? drainStartedAtUtc = null;
         var draining = instanceRegistry.IsDraining;
+
+        // Shared by both places below that transition into drain mode, so the cooperative push
+        // signal (RequestDrain) and the backing-store write (BeginDrainAsync) can never drift apart.
+        async Task enterDrainModeAsync()
+        {
+            draining = true;
+            drainStartedAtUtc = DateTimeOffset.UtcNow;
+            drainable?.RequestDrain();
+            await instanceRegistry.BeginDrainAsync(CancellationToken.None);
+        }
 
         LeasedWorkerRunnerLog.RunnerStarting(logger, displayName, instanceIdentityProvider.InstanceId);
 
@@ -42,11 +68,13 @@ public sealed class LeasedWorkerRunner(
             // This loop is the leader-election state machine for the workload.
             while (true)
             {
-                if (!draining && (stoppingToken.IsCancellationRequested || instanceRegistry.IsDraining))
+                // Only enter drain mode when the whole instance is shutting down or a drain was
+                // requested externally. A plain stoppingToken cancellation means this runner was
+                // removed by a coordinator (workload reassignment) — that must NOT mark the
+                // entire instance as draining in the backing store.
+                if (!draining && (shutdownToken.IsCancellationRequested || instanceRegistry.IsDraining))
                 {
-                    draining = true;
-                    drainStartedAtUtc = DateTimeOffset.UtcNow;
-                    await instanceRegistry.BeginDrainAsync(CancellationToken.None);
+                    await enterDrainModeAsync();
                 }
 
                 if (draining && workerTask is null)
@@ -66,10 +94,9 @@ public sealed class LeasedWorkerRunner(
                 }
                 catch (OperationCanceledException) when (!draining && stoppingToken.IsCancellationRequested)
                 {
-                    draining = true;
-                    drainStartedAtUtc = DateTimeOffset.UtcNow;
-                    await instanceRegistry.BeginDrainAsync(CancellationToken.None);
-                    continue;
+                    // stoppingToken was cancelled — workload was reassigned by the coordinator.
+                    // Exit the loop cleanly without entering drain mode or touching the instance registry.
+                    break;
                 }
 
                 if (ownsLease && workerTask is null)
@@ -127,11 +154,20 @@ public sealed class LeasedWorkerRunner(
                 {
                     await Task.Delay(renewInterval, stoppingToken);
                 }
+                catch (OperationCanceledException) when (!draining && shutdownToken.IsCancellationRequested)
+                {
+                    // The whole instance is shutting down — enter drain mode. Checked before the
+                    // stoppingToken filter below so that a standalone hosted service (which passes
+                    // the same token as both stoppingToken and shutdownToken, per
+                    // LeasedWorkerHostedService) still drains: when a single cancellation trips
+                    // both filters at once, the shutdown/drain outcome must win.
+                    await enterDrainModeAsync();
+                }
                 catch (OperationCanceledException) when (!draining && stoppingToken.IsCancellationRequested)
                 {
-                    draining = true;
-                    drainStartedAtUtc = DateTimeOffset.UtcNow;
-                    await instanceRegistry.BeginDrainAsync(CancellationToken.None);
+                    // stoppingToken fired during the delay — workload was reassigned.
+                    // Exit cleanly; do not enter drain mode or call BeginDrainAsync.
+                    break;
                 }
             }
         }

@@ -38,7 +38,7 @@ internal class LeasedWorkerRunnerTests
         });
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
-        await runner.RunAsync(cts.Token).WaitAsync(TimeSpan.FromSeconds(5));
+        await runner.RunAsync(cts.Token, shutdownToken: cts.Token).WaitAsync(TimeSpan.FromSeconds(5));
 
         workerStarted.Should().BeFalse();
     }
@@ -68,7 +68,7 @@ internal class LeasedWorkerRunnerTests
         });
 
         using var cts = new CancellationTokenSource();
-        var runTask = runner.RunAsync(cts.Token);
+        var runTask = runner.RunAsync(cts.Token, shutdownToken: cts.Token);
 
         await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         ownsLease = false;
@@ -94,7 +94,7 @@ internal class LeasedWorkerRunnerTests
         });
 
         using var cts = new CancellationTokenSource();
-        var runTask = runner.RunAsync(cts.Token);
+        var runTask = runner.RunAsync(cts.Token, shutdownToken: cts.Token);
 
         await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await cts.CancelAsync();
@@ -130,7 +130,7 @@ internal class LeasedWorkerRunnerTests
             drainTimeout: TimeSpan.FromMilliseconds(50));
 
         using var cts = new CancellationTokenSource();
-        var runTask = runner.RunAsync(cts.Token);
+        var runTask = runner.RunAsync(cts.Token, shutdownToken: cts.Token);
 
         await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await cts.CancelAsync();
@@ -145,17 +145,97 @@ internal class LeasedWorkerRunnerTests
     }
 
     [Test]
+    public async Task InstanceShutdown_WithDrainableWorkload_ShouldCallRequestDrainImmediately()
+    {
+        this.mockedLeaseManager
+            .Setup(x => x.TryAcquireOrRenewAsync("workload", "instance-a", LeaseTtl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var workerStarted = new TaskCompletionSource();
+        var drainable = new FakeDrainableService();
+        var runner = this.buildRunner(
+            async ct =>
+            {
+                workerStarted.TrySetResult();
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            },
+            drainable: drainable);
+
+        using var cts = new CancellationTokenSource();
+        var runTask = runner.RunAsync(cts.Token, shutdownToken: cts.Token);
+
+        await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cts.CancelAsync();
+
+        // RequestDrain should fire as soon as drain mode is entered - well before drainTimeout -
+        // so a cooperative workload gets the maximum possible time to wrap up on its own.
+        await waitUntilAsync(() => drainable.DrainRequested, TimeSpan.FromSeconds(5));
+
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Test]
     public async Task AlreadyDrainingInstanceCase_ShouldExitWithoutAcquiringLease()
     {
         this.instanceRegistry.IsDraining = true;
 
         var runner = this.buildRunner(_ => Task.CompletedTask);
 
-        await runner.RunAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        await runner.RunAsync(CancellationToken.None, shutdownToken: CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
 
         this.mockedLeaseManager.Verify(
             x => x.TryAcquireOrRenewAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()),
             Times.Never);
+    }
+
+    [Test]
+    public async Task WorkloadReassignment_WhenStoppingTokenCancelled_ShouldNotCallBeginDrainAsync()
+    {
+        // stoppingToken is the per-runner token a coordinator cancels on reassignment; it must
+        // not be conflated with the instance-level shutdownToken.
+        this.mockedLeaseManager
+            .Setup(x => x.TryAcquireOrRenewAsync("workload", "instance-a", LeaseTtl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var runner = this.buildRunner(_ => Task.CompletedTask);
+
+        using var stoppingCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        using var shutdownCts = new CancellationTokenSource();
+
+        await runner.RunAsync(stoppingCts.Token, shutdownToken: shutdownCts.Token).WaitAsync(TimeSpan.FromSeconds(5));
+
+        this.instanceRegistry.IsDraining.Should().BeFalse(
+            "cancelling the per-runner stoppingToken (workload reassignment) must not drain the instance");
+    }
+
+    [Test]
+    public async Task InstanceShutdown_WhenShutdownTokenCancelled_ShouldCallBeginDrainAsync()
+    {
+        // shutdownToken is the host-level token cancelled during instance shutdown; only that one
+        // should flip the instance into drain mode.
+        this.mockedLeaseManager
+            .Setup(x => x.TryAcquireOrRenewAsync("workload", "instance-a", LeaseTtl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var runner = this.buildRunner(_ => Task.CompletedTask);
+
+        using var stoppingCts = new CancellationTokenSource();
+        using var shutdownCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+
+        var runTask = runner.RunAsync(stoppingCts.Token, shutdownToken: shutdownCts.Token);
+
+        await waitUntilAsync(() => this.instanceRegistry.IsDraining, TimeSpan.FromSeconds(5));
+        await stoppingCts.CancelAsync();
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        this.instanceRegistry.IsDraining.Should().BeTrue(
+            "cancelling shutdownToken (instance shutdown) must drain the instance");
     }
 
     private static async Task waitUntilAsync(Func<bool> condition, TimeSpan timeout)
@@ -168,7 +248,10 @@ internal class LeasedWorkerRunnerTests
         }
     }
 
-    private LeasedWorkerRunner buildRunner(Func<CancellationToken, Task> executeAsync, TimeSpan? drainTimeout = null)
+    private LeasedWorkerRunner buildRunner(
+        Func<CancellationToken, Task> executeAsync,
+        TimeSpan? drainTimeout = null,
+        IDrainableService? drainable = null)
         => new (
             NullLogger.Instance,
             this.mockedLeaseManager.Object,
@@ -179,7 +262,8 @@ internal class LeasedWorkerRunnerTests
             leaseTtl: LeaseTtl,
             renewInterval: RenewInterval,
             drainTimeout: drainTimeout ?? DrainTimeout,
-            executeAsync: executeAsync);
+            executeAsync: executeAsync,
+            drainable: drainable);
 
     private sealed class FixedInstanceIdentityProvider(string instanceId)
         : IInstanceIdentityProvider
@@ -205,5 +289,12 @@ internal class LeasedWorkerRunnerTests
         public Task<string[]> GetActiveInstanceIdsAsync(CancellationToken ct) => Task.FromResult(Array.Empty<string>());
 
         public Task RemoveCurrentAsync(CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private sealed class FakeDrainableService : IDrainableService
+    {
+        public bool DrainRequested { get; private set; }
+
+        public void RequestDrain() => this.DrainRequested = true;
     }
 }

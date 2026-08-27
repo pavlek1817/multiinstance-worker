@@ -31,6 +31,25 @@ consuming application supplies that by implementing two small interfaces.
   workloads across the active instance ids (sorted, even split, remainder to the
   earliest instances), so a coordinator can decide which workloads *this* instance
   should run.
+- `WorkloadCoordinatorHostedService<TWorkload>` — the sharded-workload counterpart
+  to `LeasedWorkerHostedService`: one hosted service that heartbeats, re-evaluates
+  `BalancedNamedWorkloadAssigner`'s assignment every tick, and reconciles one
+  `LeasedWorkerRunner` per assigned workload — starting runners for newly assigned
+  workloads and stopping ones that dropped out of the assignment. A workload that
+  drops out while this instance is draining is left to finish on its own (same
+  `drainTimeout`-bounded handling as full shutdown); one that drops out from a plain
+  rebalance while the instance is healthy is stopped immediately. Workload
+  construction and execution stay entirely in the `executeAsync` delegate you supply
+  — this class knows nothing about what a workload actually does.
+- `IDrainableService` — an optional `RequestDrain()` contract a workload can implement
+  to receive its own cooperative stop signal, instead of depending on `IInstanceRegistry`
+  just to poll `IsDraining`. Pass the workload as `drainable` to `LeasedWorkerRunner` /
+  `LeasedWorkerHostedService` (or resolve it per-workload via
+  `WorkloadCoordinatorHostedService<TWorkload>`'s `drainableSelector`) and `RequestDrain()`
+  is called the moment that runner enters drain mode — well before `drainTimeout` would
+  force a cancellation. It's still optional: a workload can instead observe
+  `IInstanceRegistry.IsDraining` itself, or just rely on the cancellation token plus
+  `drainTimeout`.
 - `LeaderElectionConfig` — timing knobs (lease TTL / renew interval, heartbeat TTL /
   interval) with validation that renewal intervals stay safely inside their TTLs.
 
@@ -52,19 +71,43 @@ services.AddSingleton<IHostedService>(sp => new LeasedWorkerHostedService(
     leaseTtl: TimeSpan.FromSeconds(30),
     renewInterval: TimeSpan.FromSeconds(10),
     drainTimeout: TimeSpan.FromSeconds(60),
-    executeAsync: ct => sp.GetRequiredService<SomeBackgroundJob>().ExecuteAsync(ct)));
+    executeAsync: ct => sp.GetRequiredService<SomeBackgroundJob>().ExecuteAsync(ct),
+    drainable: sp.GetRequiredService<SomeBackgroundJob>()));
 ```
 
-Your `executeAsync` callback should itself check `IInstanceRegistry.IsDraining` at safe boundaries
-(e.g. between units of work) and return once it's true, rather than relying solely on
-`drainTimeout` — that ceiling exists to force a stop if the worker doesn't cooperate, not as
-the primary drain signal.
+Have `SomeBackgroundJob` implement `IDrainableService` and check its own flag at safe boundaries
+(e.g. between units of work), rather than relying solely on `drainTimeout` — that ceiling exists to
+force a stop if the worker doesn't cooperate, not as the primary drain signal. This keeps the
+workload itself free of any dependency on `IInstanceRegistry`; it only needs to know "wrap up now".
 
-For a set of *sharded* (not just singleton) workloads, write a coordinator hosted
-service that on each tick: calls `IInstanceRegistry.HeartbeatAsync`, reads
-`GetActiveInstanceIdsAsync`, asks `BalancedNamedWorkloadAssigner` which of your
-workloads belong to this instance, and starts/stops one `LeasedWorkerRunner` per
-assigned workload. See `docs/leader-election-flow.md` for the full lifecycle.
+For a set of *sharded* (not just singleton) workloads, use
+`WorkloadCoordinatorHostedService<TWorkload>` instead of one `LeasedWorkerHostedService`
+per workload:
+
+```csharp
+services.AddSingleton<BalancedNamedWorkloadAssigner>();
+services.AddSingleton<IReadOnlyCollection<YourWorkload>>(sp => YourWorkloadCatalog.All);
+
+services.AddSingleton<IHostedService>(sp => new WorkloadCoordinatorHostedService<YourWorkload>(
+    sp.GetRequiredService<ILogger<WorkloadCoordinatorHostedService<YourWorkload>>>(),
+    sp.GetRequiredService<ILoggerFactory>(),
+    sp.GetRequiredService<IInstanceRegistry>(),
+    sp.GetRequiredService<IInstanceIdentityProvider>(),
+    sp.GetRequiredService<ILeaseManager>(),
+    sp.GetRequiredService<BalancedNamedWorkloadAssigner>(),
+    sp.GetRequiredService<IReadOnlyCollection<YourWorkload>>(),
+    keySelector: w => w.Key,
+    displayNameSelector: w => w.DisplayName,
+    executeAsync: (workload, ct) => sp.GetRequiredService<YourWorkloadRunner>().ExecuteAsync(workload, ct),
+    leaseTtl: TimeSpan.FromSeconds(30),
+    renewInterval: TimeSpan.FromSeconds(10),
+    drainTimeout: TimeSpan.FromSeconds(60),
+    heartbeatInterval: TimeSpan.FromSeconds(5),
+    drainableSelector: workload => sp.GetRequiredService<YourWorkloadRunner>().GetDrainable(workload)));
+```
+
+`YourWorkload` is entirely your own type — the coordinator only needs a key and a display name out
+of it. See `docs/leader-election-flow.md` for the full lifecycle.
 
 ## Project layout
 
@@ -144,8 +187,10 @@ here. Wiring that service up to this package means:
 3. Delete the consumer's local copies of `IInstanceIdentityProvider`,
    `ProcessInstanceIdentityProvider`, `IRedisLeaseManager` → `ILeaseManager`,
    `LeasedWorkerRunner`, `LeasedWorkerHostedService`, `BalancedNamedWorkloadAssigner`,
-   and `LeaderElectionConfig`, and update `using`s to this package's namespace
-   (`MultiInstanceWorker`) instead of the consumer's own.
-4. Keep the consumer's game-engine-specific coordinator (workload descriptors,
-   the hosted service that constructs the actual game engine per workload) in the
-   consumer — that piece is domain-specific and stays out of this library.
+   `LeaderElectionConfig`, and `IDrainableService`, and update `using`s to this
+   package's namespace (`MultiInstanceWorker`) instead of the consumer's own.
+4. Replace the consumer's own coordinator with `WorkloadCoordinatorHostedService<TWorkload>`,
+   supplying its workload descriptor type, key/display-name selectors, and an
+   `executeAsync` delegate that constructs and runs the actual workload (e.g. a game
+   engine per workload). That construction logic is domain-specific and stays in the
+   consumer — only the heartbeat/assign/reconcile loop moves into this library.

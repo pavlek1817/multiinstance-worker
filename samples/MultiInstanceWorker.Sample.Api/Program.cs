@@ -51,6 +51,15 @@ foreach (var job in JobCatalog.All)
     {
         var timing = sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value;
 
+        // One instance per job, reused for the app's lifetime: it's both the workload
+        // (executeAsync) and the runner's cooperative drain target (drainable), so RequestDrain
+        // and the ticking loop share the same drain flag.
+        var sampleJob = new SampleWorkerJob(
+            job.Name,
+            sp.GetRequiredService<JobExecutionTracker>(),
+            sp.GetRequiredService<IInstanceIdentityProvider>(),
+            sp.GetRequiredService<ILogger<LeasedWorkerHostedService>>());
+
         return new LeasedWorkerHostedService(
             sp.GetRequiredService<ILogger<LeasedWorkerHostedService>>(),
             sp.GetRequiredService<ILeaseManager>(),
@@ -61,12 +70,8 @@ foreach (var job in JobCatalog.All)
             leaseTtl: TimeSpan.FromSeconds(timing.LeaseTtlSeconds),
             renewInterval: TimeSpan.FromMilliseconds(timing.LeaseRenewIntervalMs),
             drainTimeout: TimeSpan.FromSeconds(timing.DrainTimeoutSeconds),
-            executeAsync: ct => SampleWorkerJob.RunAsync(
-                job.Name,
-                sp.GetRequiredService<JobExecutionTracker>(),
-                sp.GetRequiredService<IInstanceRegistry>(),
-                sp.GetRequiredService<ILogger<LeasedWorkerHostedService>>(),
-                ct));
+            executeAsync: sampleJob.RunAsync,
+            drainable: sampleJob);
     });
 }
 

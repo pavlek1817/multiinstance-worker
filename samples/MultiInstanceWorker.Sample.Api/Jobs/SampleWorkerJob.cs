@@ -7,16 +7,32 @@ namespace MultiInstanceWorker.Sample.Api.Jobs;
 /// two jobs. It doesn't do anything domain-specific - it just ticks on an interval and records
 /// that it did, so <c>/diagnostics</c> can show which instance is currently running it.
 /// </summary>
-public static class SampleWorkerJob
+/// <remarks>
+/// Deliberately doesn't depend on <see cref="IInstanceRegistry"/> - that's a leader-election
+/// concern, not something a workload should need to know about just to find out it should wrap
+/// up. Instead it implements <see cref="IDrainableService"/>, and whoever registers this job as a
+/// workload (see <c>Program.cs</c>) also passes it as the runner's <c>drainable</c>, so
+/// <see cref="RequestDrain"/> gets called for it automatically when the runner enters drain mode.
+/// </remarks>
+public sealed class SampleWorkerJob(
+    string jobName,
+    JobExecutionTracker tracker,
+    IInstanceIdentityProvider instanceIdentityProvider,
+    ILogger logger)
+    : IDrainableService
 {
     private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(250);
 
-    public static async Task RunAsync(
-        string jobName,
-        JobExecutionTracker tracker,
-        IInstanceRegistry instanceRegistry,
-        ILogger logger,
-        CancellationToken ct)
+    private volatile bool draining;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// One-way, same as the runner's own drain flag: once a runner starts draining it never goes
+    /// back to normal operation, so there's no need for this job to un-drain either.
+    /// </remarks>
+    public void RequestDrain() => this.draining = true;
+
+    public async Task RunAsync(CancellationToken ct)
     {
         tracker.MarkStarted(jobName);
 
@@ -24,10 +40,10 @@ public static class SampleWorkerJob
         {
             while (!ct.IsCancellationRequested)
             {
-                // Best practice from the README: a cooperative workload checks IsDraining itself
-                // at a safe boundary (here, between ticks) and stops on its own, rather than
-                // relying solely on the runner's drainTimeout to force it.
-                if (instanceRegistry.IsDraining)
+                // The runner calls RequestDrain() the moment it enters drain mode; checking that
+                // flag here (between ticks) is what lets this job wrap up on its own well before
+                // the runner's drainTimeout would force it via cancellation.
+                if (this.draining)
                 {
                     SampleWorkerJobLog.ObservedDraining(logger, jobName);
                     break;
@@ -35,7 +51,7 @@ public static class SampleWorkerJob
 
                 tracker.RecordTick(jobName);
                 var snapshot = tracker.Snapshot(jobName);
-                SampleWorkerJobLog.Tick(logger, jobName, snapshot.TickCount, instanceRegistry.InstanceId);
+                SampleWorkerJobLog.Tick(logger, jobName, snapshot.TickCount, instanceIdentityProvider.InstanceId);
 
                 await Task.Delay(TickInterval, ct);
             }
