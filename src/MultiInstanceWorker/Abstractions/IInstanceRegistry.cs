@@ -13,10 +13,18 @@ public interface IInstanceRegistry
     /// <summary>Returns the current instance identity.</summary>
     string InstanceId { get; }
 
+    /// <summary>Gets a value indicating whether this instance is currently draining.</summary>
+    bool IsDraining { get; }
+
     /// <summary>Refreshes the current instance heartbeat record in the backing store.</summary>
     Task HeartbeatAsync(CancellationToken ct);
 
-    /// <summary>Returns the set of active instance ids currently visible to the coordinator.</summary>
+    /// <summary>Marks the current instance as draining and persists that state to the backing store.</summary>
+    Task BeginDrainAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Returns the set of active, non-draining instance ids currently visible to the coordinator.
+    /// </summary>
     Task<string[]> GetActiveInstanceIdsAsync(CancellationToken ct);
 
     /// <summary>Removes the current instance from the active-instance index.</summary>
