@@ -123,12 +123,14 @@ docs/leader-election-flow.md            lifecycle diagram and write-up
 
 `samples/MultiInstanceWorker.Sample.Api` is a minimal-API app that wires this library up to a
 **Redis-backed `ILeaseManager`/`IInstanceRegistry`** (`samples/.../Redis/RedisLeaseManager.cs`,
-`RedisInstanceRegistry.cs`) and runs two independent singleton jobs (`order-cleanup`,
-`inventory-sync`) via `LeasedWorkerHostedService`. That Redis adapter deliberately lives in the
-sample, not in this package — see [Why no `MultiInstanceWorker.Redis` package (yet)](#why-no-multiinstanceworkerredis-package-yet)
+`RedisInstanceRegistry.cs`) and runs two named jobs (`order-cleanup`, `inventory-sync`) as
+sharded workloads under one `WorkloadCoordinatorHostedService<TWorkload>`, which splits them
+across the active instances via `BalancedNamedWorkloadAssigner` instead of leaving each job to
+race for its own lease. That Redis adapter deliberately lives in the sample, not in this package —
+see [Why no `MultiInstanceWorker.Redis` package (yet)](#why-no-multiinstanceworkerredis-package-yet)
 below.
 
-Run two instances against the same Redis and watch them contend for the same two leases:
+Run two instances against the same Redis and watch the two jobs settle one-per-instance:
 
 ```
 dotnet run --project samples/MultiInstanceWorker.Sample.Api --launch-profile InstanceA
@@ -138,7 +140,9 @@ dotnet run --project samples/MultiInstanceWorker.Sample.Api --launch-profile Ins
 Both profiles default to `localhost:6379`; point `Redis:ConnectionString` at whatever Redis you
 have running (`docker run --rm -p 6379:6379 redis:7.4` works). Each instance exposes:
 
-- `GET /diagnostics` — this instance's id, drain state, and per-job tick counts/ownership.
+- `GET /diagnostics` — this instance's id and drain state, plus each job's owner instance id,
+  total tick count, and last tick time - read straight from Redis, so it's the same fleet-wide
+  view whichever instance you ask.
 - `GET /instances` — the active (non-draining) instance ids this instance currently sees.
 - `POST /drain` — manually triggers this instance's drain, without stopping its host, to see the
   other instance take over both jobs.

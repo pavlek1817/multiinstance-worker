@@ -1,16 +1,17 @@
 namespace MultiInstanceWorker.Sample.Api.Jobs;
 
 /// <summary>
-/// The workload body handed to <see cref="LeasedWorkerHostedService"/> for each of the sample's
-/// two jobs. It doesn't do anything domain-specific - it just ticks on an interval and records
-/// that it did, so <c>/diagnostics</c> can show which instance is currently running it.
+/// The workload body handed to <see cref="WorkloadCoordinatorHostedService{TWorkload}"/> for each
+/// of the sample's two jobs. It doesn't do anything domain-specific - it just ticks on an interval
+/// and records that it did, so <c>/diagnostics</c> can show which instance is currently running it.
 /// </summary>
 /// <remarks>
 /// Deliberately doesn't depend on <see cref="IInstanceRegistry"/> - that's a leader-election
 /// concern, not something a workload should need to know about just to find out it should wrap
 /// up. Instead it implements <see cref="IDrainableService"/>, and whoever registers this job as a
-/// workload (see <c>Program.cs</c>) also passes it as the runner's <c>drainable</c>, so
-/// <see cref="RequestDrain"/> gets called for it automatically when the runner enters drain mode.
+/// workload (see <c>Program.cs</c>) also passes it as the coordinator's <c>drainableSelector</c>
+/// result, so <see cref="RequestDrain"/> gets called for it automatically when its runner enters
+/// drain mode.
 /// </remarks>
 public sealed class SampleWorkerJob(
     string jobName,
@@ -32,8 +33,6 @@ public sealed class SampleWorkerJob(
 
     public async Task RunAsync(CancellationToken ct)
     {
-        tracker.MarkStarted(jobName);
-
         try
         {
             while (!ct.IsCancellationRequested)
@@ -47,19 +46,17 @@ public sealed class SampleWorkerJob(
                     break;
                 }
 
-                tracker.RecordTick(jobName);
-                var snapshot = tracker.Snapshot(jobName);
-                SampleWorkerJobLog.Tick(logger, jobName, snapshot.TickCount, instanceIdentityProvider.InstanceId);
+                // Written straight through to Redis (owner, tick count, last tick time) so
+                // /diagnostics on either instance sees the same fleet-wide state for this job,
+                // not just what happened to run locally.
+                var tickCount = await tracker.RecordTickAsync(jobName, ct);
+                SampleWorkerJobLog.Tick(logger, jobName, tickCount, instanceIdentityProvider.InstanceId);
 
                 await Task.Delay(TickInterval, ct);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-        }
-        finally
-        {
-            tracker.MarkStopped(jobName);
         }
     }
 }

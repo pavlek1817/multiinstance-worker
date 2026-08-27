@@ -1,54 +1,43 @@
-using System.Collections.Concurrent;
+using MultiInstanceWorker.Sample.Api.Redis;
 
 namespace MultiInstanceWorker.Sample.Api.Jobs;
 
 /// <summary>
-/// In-memory record of what each worker job is doing on this instance, purely so the
-/// <c>/diagnostics</c> endpoint has something to report. Not part of the leader-election
-/// mechanism itself - the Redis lease is the only thing that actually decides ownership.
+/// Reads and writes each job's live execution state through <see cref="RedisJobExecutionStore"/>,
+/// so <c>/diagnostics</c> shows the same fleet-wide view - current owner, total ticks, last tick
+/// time - no matter which instance answers the request, instead of each instance only knowing
+/// about jobs it happens to run itself.
 /// </summary>
-public sealed class JobExecutionTracker
+public sealed class JobExecutionTracker(RedisJobExecutionStore store, IInstanceIdentityProvider instanceIdentityProvider)
 {
-    private readonly ConcurrentDictionary<string, State> states = new (StringComparer.Ordinal);
+    /// <summary>Records one tick for <paramref name="jobName"/> on this instance and returns the job's new total tick count.</summary>
+    public Task<long> RecordTickAsync(string jobName, CancellationToken ct) =>
+        store.RecordTickAsync(jobName, instanceIdentityProvider.InstanceId, ct);
 
-    public void MarkStarted(string jobName) => this.states.AddOrUpdate(
-        jobName,
-        _ => new State(true, 0, null),
-        (_, existing) => new State(true, existing.TickCount, existing.LastTickAtUtc));
-
-    public void MarkStopped(string jobName) => this.states.AddOrUpdate(
-        jobName,
-        _ => new State(false, 0, null),
-        (_, existing) => new State(false, existing.TickCount, existing.LastTickAtUtc));
-
-    public void RecordTick(string jobName) => this.states.AddOrUpdate(
-        jobName,
-        _ => new State(true, 1, DateTimeOffset.UtcNow),
-        (_, existing) => new State(true, existing.TickCount + 1, DateTimeOffset.UtcNow));
-
-    public JobSnapshot Snapshot(string jobName) => this.states.TryGetValue(jobName, out var state)
-        ? new JobSnapshot(jobName, state.IsRunningHere, state.TickCount, state.LastTickAtUtc)
-        : new JobSnapshot(jobName, false, 0, null);
-
-    public IReadOnlyCollection<JobSnapshot> SnapshotAll() => this.states
-        .Select(kvp => new JobSnapshot(kvp.Key, kvp.Value.IsRunningHere, kvp.Value.TickCount, kvp.Value.LastTickAtUtc))
-        .ToArray();
-
-    private sealed class State(bool isRunningHere, long tickCount, DateTimeOffset? lastTickAtUtc)
+    public async Task<IReadOnlyCollection<JobSnapshot>> SnapshotAllAsync(IEnumerable<string> jobNames, CancellationToken ct)
     {
-        public bool IsRunningHere { get; } = isRunningHere;
+        var stats = await store.GetAllAsync(jobNames, ct);
 
-        public long TickCount { get; } = tickCount;
-
-        public DateTimeOffset? LastTickAtUtc { get; } = lastTickAtUtc;
+        return stats
+            .Select(s => new JobSnapshot(
+                s.JobName,
+                s.OwnerInstanceId,
+                isRunningHere: s.OwnerInstanceId == instanceIdentityProvider.InstanceId,
+                s.TickCount,
+                s.LastTickAtUtc))
+            .ToArray();
     }
 }
 
-/// <summary>Point-in-time view of one job's execution state on this instance, for <c>/diagnostics</c>.</summary>
-public sealed class JobSnapshot(string name, bool isRunningHere, long tickCount, DateTimeOffset? lastTickAtUtc)
+/// <summary>Point-in-time view of one job's execution state, for <c>/diagnostics</c>.</summary>
+public sealed class JobSnapshot(string name, string? ownerInstanceId, bool isRunningHere, long tickCount, DateTimeOffset? lastTickAtUtc)
 {
     public string Name { get; } = name;
 
+    // The instance id Redis last saw tick this job, or null if it has never ticked.
+    public string? OwnerInstanceId { get; } = ownerInstanceId;
+
+    // Whether the instance answering this request is the one currently ticking this job.
     public bool IsRunningHere { get; } = isRunningHere;
 
     public long TickCount { get; } = tickCount;
