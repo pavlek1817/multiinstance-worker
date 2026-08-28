@@ -9,10 +9,11 @@ using Microsoft.Extensions.Configuration;
 namespace MultiInstanceWorker.FunctionalTests;
 
 /// <summary>
-/// Runs two real instances of the sample API - each hosting the same two worker jobs - against
-/// one shared Redis, and proves the thing this whole exercise is about: the Redis lease keeps
-/// exactly one instance running each job at a time, and the other instance takes over once the
-/// owner stops.
+/// Runs two real instances of the sample API - each hosting the same worker jobs - against one
+/// shared Redis, and proves the thing this whole exercise is about: the Redis lease keeps exactly
+/// one instance running each job at a time, and the other instance takes over once the owner
+/// stops. Only exercises the two <c>JobCatalog.Balanced</c> jobs - <c>JobCatalog.Primary</c>'s
+/// active/passive behavior is a separate concern from what this suite is proving here.
 /// </summary>
 internal sealed class TwoInstanceApiTests
 {

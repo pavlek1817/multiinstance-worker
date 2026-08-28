@@ -49,11 +49,14 @@ consuming application supplies that by implementing two small interfaces.
   its `IWorkloadAssigner`'s assignment every tick, and reconciles one
   `LeasedWorkerRunner` per assigned workload — starting runners for newly assigned
   workloads and stopping ones that dropped out of the assignment. A workload that
-  drops out while this instance is draining is left to finish on its own (same
-  `drainTimeout`-bounded handling as full shutdown); one that drops out from a plain
-  rebalance while the instance is healthy is stopped immediately. Workload
-  construction and execution stay entirely in the `executeAsync` delegate you supply
-  — this class knows nothing about what a workload actually does.
+  drops out of the assignment — whether because this instance is draining or because
+  a plain rebalance moved it elsewhere — gets the same `drainTimeout`-bounded "let it
+  finish" treatment as a full shutdown; a rebalance just never marks the *instance*
+  itself as draining the way a real shutdown does. The coordinator's own tick loop
+  never blocks waiting on this: a still-finishing runner is left alone and cleaned up
+  on a later tick, so this instance's own heartbeat keeps going the whole time.
+  Workload construction and execution stay entirely in the `executeAsync` delegate
+  you supply — this class knows nothing about what a workload actually does.
 - `IDrainableService` — an optional `RequestDrain()` contract a workload can implement
   to receive its own cooperative stop signal, instead of depending on `IInstanceRegistry`
   just to poll `IsDraining`. Pass the workload as `drainable` to `LeasedWorkerHostedService`
@@ -133,18 +136,25 @@ test/MultiInstanceWorker.FunctionalTests/ functional tests against a real Redis 
 docs/leader-election-flow.md            lifecycle diagram and write-up
 ```
 
-## Sample app: two instances, two jobs, real Redis
+## Sample app: two instances, six jobs, real Redis
 
 `samples/MultiInstanceWorker.Sample.Api` is a minimal-API app that wires this library up to a
 **Redis-backed `ILeaseManager`/`IInstanceRegistry`** (`samples/.../Redis/RedisLeaseManager.cs`,
-`RedisInstanceRegistry.cs`) and runs two named jobs (`order-cleanup`, `inventory-sync`) as
-sharded workloads under one `WorkloadCoordinatorHostedService<TWorkload>`, which splits them
-across the active instances via `BalancedNamedWorkloadAssigner` instead of leaving each job to
-race for its own lease. That Redis adapter deliberately lives in the sample, not in this package —
-see [Why no `MultiInstanceWorker.Redis` package (yet)](#why-no-multiinstanceworkerredis-package-yet)
+`RedisInstanceRegistry.cs`) and runs six named jobs (`JobCatalog`) as sharded workloads under two
+`WorkloadCoordinatorHostedService<TWorkload>`s, each with its own `IWorkloadAssigner` strategy,
+instead of leaving each job to race for its own lease:
+
+- `JobCatalog.Balanced` (`order-cleanup`, `inventory-sync`, `email-digest`, `cache-warmup`) —
+  spread evenly across the active instances via `BalancedNamedWorkloadAssigner` (the default).
+- `JobCatalog.Primary` (`billing-reconciliation`, `nightly-report`) — active/passive via
+  `PrimaryNodeWorkloadAssigner`, all owned by whichever instance joined earliest.
+
+That Redis adapter deliberately lives in the sample, not in this package — see
+[Why no `MultiInstanceWorker.Redis` package (yet)](#why-no-multiinstanceworkerredis-package-yet)
 below.
 
-Run two instances against the same Redis and watch the two jobs settle one-per-instance:
+Run two instances against the same Redis and watch the balanced jobs settle one-per-instance,
+while the primary jobs both land on whichever instance joined first:
 
 ```
 dotnet run --project samples/MultiInstanceWorker.Sample.Api --launch-profile InstanceA

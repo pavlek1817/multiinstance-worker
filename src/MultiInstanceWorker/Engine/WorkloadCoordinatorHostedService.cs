@@ -88,7 +88,7 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
                     activeInstances,
                     instanceRegistry.InstanceId);
 
-                await this.reconcileRunnersAsync(assignedWorkloads, stoppingToken, instanceRegistry.IsDraining);
+                await this.reconcileRunnersAsync(assignedWorkloads, stoppingToken);
                 await this.throwIfAnyRunnerFaultedAsync();
 
                 await Task.Delay(heartbeatInterval, stoppingToken);
@@ -116,10 +116,21 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
     /// <summary>
     /// Starts runners for newly assigned workloads and stops runners that are no longer owned.
     /// </summary>
+    /// <remarks>
+    /// A workload can drop out of this instance's assignment either because it was reassigned
+    /// elsewhere (a plain rebalance) or because this instance itself started draining — either way
+    /// it gets the same graceful "let it finish" treatment: <see cref="LeasedWorkerRunner"/> treats
+    /// a plain reassignment the same as a drain internally (finishes the in-flight worker on its
+    /// own, up to its <c>drainTimeout</c>, without marking the whole instance draining). Removal
+    /// itself is fire-and-forget from here — this method must never block waiting for a removed
+    /// runner to finish, since that would stall this instance's own heartbeat/reconcile loop (and
+    /// so risk the rest of the fleet seeing a perfectly healthy instance as dead) for as long as the
+    /// removed workload takes to wind down. A runner that already finished is cleaned up
+    /// immediately; one still running is left alone and picked up on a later tick.
+    /// </remarks>
     private async Task reconcileRunnersAsync(
         IReadOnlyCollection<TWorkload> assignedWorkloads,
-        CancellationToken stoppingToken,
-        bool isDraining)
+        CancellationToken stoppingToken)
     {
         var assignedByKey = assignedWorkloads.ToDictionary(keySelector);
 
@@ -129,22 +140,24 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
 
         foreach (var removedKey in removedKeys)
         {
-            // A workload can drop out of this instance's assignment either because it was
-            // reassigned elsewhere (a plain rebalance) or because this instance itself started
-            // draining. Only the latter gets the graceful "let it finish" treatment — a plain
-            // rebalance while this instance is healthy stops the runner immediately.
-            if (isDraining && this.activeRunners.TryGetValue(removedKey, out var state) && !state.ExecutionTask.IsCompleted)
+            if (!this.activeRunners.TryGetValue(removedKey, out var state))
             {
                 continue;
             }
 
-            if (isDraining && this.activeRunners.TryGetValue(removedKey, out var completedState) && completedState.ExecutionTask.IsCompleted)
+            if (state.ExecutionTask.IsCompleted)
             {
                 await this.removeCompletedRunnerAsync(removedKey);
                 continue;
             }
 
-            await this.stopRunnerAsync(removedKey);
+            // Cancel() is idempotent, so it's safe to call again on every tick a removed workload
+            // is still winding down - only log the first time so a long wind-down doesn't spam.
+            if (!state.CancellationTokenSource.IsCancellationRequested)
+            {
+                WorkloadCoordinatorLog.WorkloadRemoved(logger, removedKey);
+                state.CancellationTokenSource.Cancel();
+            }
         }
 
         foreach (var workload in assignedByKey.Values)

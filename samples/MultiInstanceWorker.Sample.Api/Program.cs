@@ -64,20 +64,35 @@ builder.Services.AddSingleton<IReadOnlyDictionary<string, SampleWorkerJob>>(sp =
         job => new SampleWorkerJob(job.Name, tracker, identity, jobLogger));
 });
 
-// A single coordinator hosted service replaces one LeasedWorkerHostedService per job: instead of
-// each job racing independently for its own lease (whichever instance gets there first keeps it
-// forever, so nothing stops one instance from ending up with every job), the coordinator
-// heartbeats, asks its IWorkloadAssigner for this instance's slice of JobCatalog.All on every
-// tick, and reconciles local LeasedWorkerRunners to match. It also subsumes what the sample's old
-// standalone HeartbeatHostedService did (heartbeat + remove-on-shutdown), so that service is no
-// longer registered.
+// Two coordinator hosted services - one per JobCatalog group - replace one LeasedWorkerHostedService
+// per job: instead of each job racing independently for its own lease (whichever instance gets
+// there first keeps it forever, so nothing stops one instance from ending up with every job), each
+// coordinator heartbeats, asks its own IWorkloadAssigner for this instance's slice of its group on
+// every tick, and reconciles local LeasedWorkerRunners to match. Both also subsume what the
+// sample's old standalone HeartbeatHostedService did (heartbeat + remove-on-shutdown), so that
+// service is no longer registered.
+//
+// JobCatalog.Balanced uses the default IWorkloadAssigner (BalancedNamedWorkloadAssigner - spread
+// evenly across live instances); JobCatalog.Primary passes PrimaryNodeWorkloadAssigner explicitly
+// to run active/passive instead, all on whichever instance joined earliest. Registering
+// AddWorkloadCoordinator twice is safe - each call appends its own IHostedService rather than
+// replacing the other, and the two groups' WorkloadKeys never collide.
 builder.Services.AddWorkloadCoordinator(
-    JobCatalog.All,
+    JobCatalog.Balanced,
     keySelector: job => job.WorkloadKey,
     displayNameSelector: job => job.DisplayName,
     executeAsync: (sp, job, ct) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey].RunAsync(ct),
     configFactory: sp => sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value,
     drainableSelector: (sp, job) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey]);
+
+builder.Services.AddWorkloadCoordinator(
+    JobCatalog.Primary,
+    keySelector: job => job.WorkloadKey,
+    displayNameSelector: job => job.DisplayName,
+    executeAsync: (sp, job, ct) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey].RunAsync(ct),
+    configFactory: sp => sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value,
+    drainableSelector: (sp, job) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey],
+    workloadAssigner: new PrimaryNodeWorkloadAssigner());
 
 var app = builder.Build();
 

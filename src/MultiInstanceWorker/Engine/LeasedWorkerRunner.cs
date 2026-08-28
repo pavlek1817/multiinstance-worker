@@ -8,12 +8,15 @@ namespace MultiInstanceWorker;
 /// <remarks>
 /// The runner keeps renewing the lease, starts the workload on acquisition,
 /// stops it on lease loss, and releases the lease when the host shuts down.
-/// On shutdown (or when <see cref="IInstanceRegistry.IsDraining"/> becomes true for
-/// any other reason, e.g. an operator-triggered drain ahead of downsizing) the runner
-/// stops taking new work but lets an in-flight worker finish on its own, up to
-/// <c>drainTimeout</c>, instead of cancelling it immediately. If the workload passed as
-/// <paramref name="drainable"/> implements <see cref="IDrainableService"/>, its
-/// <see cref="IDrainableService.RequestDrain"/> is invoked the moment drain mode is entered, so a
+/// On shutdown, when <see cref="IInstanceRegistry.IsDraining"/> becomes true for any other reason
+/// (e.g. an operator-triggered drain ahead of downsizing), <em>or</em> when <c>stoppingToken</c> is
+/// cancelled because a coordinator reassigned this workload elsewhere, the runner stops taking new
+/// work but lets an in-flight worker finish on its own, up to <c>drainTimeout</c>, instead of
+/// cancelling it immediately — the lease is kept renewed throughout so nothing else can acquire it
+/// out from under the still-finishing worker. A plain reassignment never marks the instance itself
+/// as draining in the backing store; only a real shutdown or an externally-requested drain does. If
+/// the workload passed as <paramref name="drainable"/> implements <see cref="IDrainableService"/>,
+/// its <see cref="IDrainableService.RequestDrain"/> is invoked the moment any of these happens, so a
 /// cooperative workload can wrap up on its own well before <c>drainTimeout</c> would force it.
 /// </remarks>
 internal sealed class LeasedWorkerRunner(
@@ -34,8 +37,9 @@ internal sealed class LeasedWorkerRunner(
     /// </summary>
     /// <param name="stoppingToken">
     /// Signals that <em>this runner</em> should stop (e.g. workload reassigned by a coordinator).
-    /// Cancelling this token exits the loop cleanly but does <b>not</b> mark the whole instance as
-    /// draining — that is the responsibility of <paramref name="shutdownToken"/>.
+    /// Cancelling this token winds the loop down gracefully — same as a real drain, including the
+    /// <c>drainTimeout</c>-bounded wait for an in-flight worker — but does <b>not</b> mark the whole
+    /// instance as draining — that is the responsibility of <paramref name="shutdownToken"/>.
     /// </param>
     /// <param name="shutdownToken">
     /// Signals that the <em>whole instance</em> is shutting down (e.g. preStop hook or SIGTERM).
@@ -51,14 +55,20 @@ internal sealed class LeasedWorkerRunner(
         DateTimeOffset? drainStartedAtUtc = null;
         var draining = instanceRegistry.IsDraining;
 
-        // Shared by both places below that transition into drain mode, so the cooperative push
+        // Shared by every place below that transitions into drain mode, so the cooperative push
         // signal (RequestDrain) and the backing-store write (BeginDrainAsync) can never drift apart.
-        async Task enterDrainModeAsync()
+        // markInstanceDraining is false for a plain reassignment (stoppingToken only) - only a real
+        // shutdown or an externally-requested drain marks the whole instance draining in the store.
+        async Task enterDrainModeAsync(bool markInstanceDraining)
         {
             draining = true;
             drainStartedAtUtc = DateTimeOffset.UtcNow;
             drainable?.RequestDrain();
-            await instanceRegistry.BeginDrainAsync(CancellationToken.None);
+
+            if (markInstanceDraining)
+            {
+                await instanceRegistry.BeginDrainAsync(CancellationToken.None);
+            }
         }
 
         LeasedWorkerRunnerLog.RunnerStarting(logger, displayName, instanceIdentityProvider.InstanceId);
@@ -68,13 +78,14 @@ internal sealed class LeasedWorkerRunner(
             // This loop is the leader-election state machine for the workload.
             while (true)
             {
-                // Only enter drain mode when the whole instance is shutting down or a drain was
-                // requested externally. A plain stoppingToken cancellation means this runner was
-                // removed by a coordinator (workload reassignment) — that must NOT mark the
-                // entire instance as draining in the backing store.
-                if (!draining && (shutdownToken.IsCancellationRequested || instanceRegistry.IsDraining))
+                // A plain stoppingToken cancellation (this runner was reassigned by a coordinator)
+                // enters the same graceful wind-down as a real drain, so an in-flight worker still
+                // gets to finish on its own — it just must NOT mark the entire instance as draining
+                // in the backing store the way shutdownToken/IsDraining do.
+                if (!draining && (shutdownToken.IsCancellationRequested || instanceRegistry.IsDraining || stoppingToken.IsCancellationRequested))
                 {
-                    await enterDrainModeAsync();
+                    var markInstanceDraining = shutdownToken.IsCancellationRequested || instanceRegistry.IsDraining;
+                    await enterDrainModeAsync(markInstanceDraining);
                 }
 
                 if (draining && workerTask is null)
@@ -94,9 +105,10 @@ internal sealed class LeasedWorkerRunner(
                 }
                 catch (OperationCanceledException) when (!draining && stoppingToken.IsCancellationRequested)
                 {
-                    // stoppingToken was cancelled — workload was reassigned by the coordinator.
-                    // Exit the loop cleanly without entering drain mode or touching the instance registry.
-                    break;
+                    // Defensive: stoppingToken flipped to cancelled between the top-of-loop check
+                    // and this call. Same graceful, non-instance-marking wind-down as above.
+                    await enterDrainModeAsync(markInstanceDraining: false);
+                    continue;
                 }
 
                 if (ownsLease && workerTask is null)
@@ -156,18 +168,19 @@ internal sealed class LeasedWorkerRunner(
                 }
                 catch (OperationCanceledException) when (!draining && shutdownToken.IsCancellationRequested)
                 {
-                    // The whole instance is shutting down — enter drain mode. Checked before the
-                    // stoppingToken filter below so that a standalone hosted service (which passes
-                    // the same token as both stoppingToken and shutdownToken, per
-                    // LeasedWorkerHostedService) still drains: when a single cancellation trips
-                    // both filters at once, the shutdown/drain outcome must win.
-                    await enterDrainModeAsync();
+                    // The whole instance is shutting down — enter drain mode, marking the instance
+                    // draining in the store. Checked before the stoppingToken filter below so that a
+                    // standalone hosted service (which passes the same token as both stoppingToken
+                    // and shutdownToken, per LeasedWorkerHostedService) still marks itself draining:
+                    // when a single cancellation trips both filters at once, the shutdown/drain
+                    // outcome must win.
+                    await enterDrainModeAsync(markInstanceDraining: true);
                 }
                 catch (OperationCanceledException) when (!draining && stoppingToken.IsCancellationRequested)
                 {
-                    // stoppingToken fired during the delay — workload was reassigned.
-                    // Exit cleanly; do not enter drain mode or call BeginDrainAsync.
-                    break;
+                    // stoppingToken fired during the delay — workload was reassigned. Enter the same
+                    // graceful wind-down as a real drain, just without marking the instance draining.
+                    await enterDrainModeAsync(markInstanceDraining: false);
                 }
             }
         }

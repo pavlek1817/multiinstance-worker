@@ -66,18 +66,29 @@ its own `CancellationTokenSource`, independent of the coordinator's host token, 
 (cancelled when the whole instance shuts down) — this is what lets one workload being reassigned
 stay a purely local event instead of draining the whole instance.
 
-A workload dropping out of this instance's assignment is handled based on *why* the instance's own
-state changed, not why the workload left:
-- instance draining, runner still running → left alone this tick, same as full shutdown
-- instance draining, runner already finished → cleaned up without cancelling
-- instance not draining (a plain rebalance) → stopped immediately, scoped to that one runner
+A workload dropping out of this instance's assignment always gets the same graceful treatment,
+regardless of *why* it dropped out — the only thing that differs is whether the whole instance
+gets marked draining in the backing store:
+- runner still running, instance draining (real shutdown or an external drain request) → left to
+  finish on its own, up to `drainTimeout`; the instance *is* marked draining
+- runner still running, plain rebalance (instance itself still healthy) → left to finish on its
+  own the same way, up to the same `drainTimeout`; the instance is *not* marked draining
+- runner already finished → cleaned up without cancelling
+
+Cancelling a runner's `CancellationTokenSource` is what starts this wind-down, but the coordinator
+never awaits it inline — it's fire-and-forget from the coordinator's perspective (`Cancel()` is
+idempotent, so calling it again on a later tick while the runner is still finishing is harmless).
+Blocking the coordinator's own tick loop on a single still-running runner would stall this
+instance's own heartbeat for as long as that runner takes to wind down, which could make the rest
+of the fleet see a perfectly healthy instance as dead — so a removed-but-still-running runner is
+simply left alone and picked up (or force-stopped past `drainTimeout`) on a later tick.
 
 Workload construction and execution stay entirely in the `executeAsync` delegate a consumer
 supplies (it knows how to construct and run each workload) — that piece is domain-specific and
 lives in the consuming application, not in this library.
 
 ### Draining
-When an instance begins draining — because its host is shutting down, or because something else flips `IInstanceRegistry.IsDraining` ahead of a planned downsize — the backing store should mark that instance's record so other nodes stop assigning new workloads to it (see `GetActiveInstanceIdsAsync`, which excludes draining instances). Each `LeasedWorkerRunner` for that instance keeps its current worker running until it reaches a safe boundary and exits on its own, up to a `drainTimeout` ceiling; only once that ceiling is hit does the runner force-cancel the worker. This is what lets an instance hand its in-flight work over cleanly instead of dropping it when the cluster is downsized.
+When an instance begins draining — because its host is shutting down, or because something else flips `IInstanceRegistry.IsDraining` ahead of a planned downsize — the backing store should mark that instance's record so other nodes stop assigning new workloads to it (see `GetActiveInstancesAsync`, which excludes draining instances). Each `LeasedWorkerRunner` for that instance keeps its current worker running until it reaches a safe boundary and exits on its own, up to a `drainTimeout` ceiling; only once that ceiling is hit does the runner force-cancel the worker. This is what lets an instance hand its in-flight work over cleanly instead of dropping it when the cluster is downsized. A plain reassignment (the coordinator moving a workload to another instance while this one stays healthy) goes through the exact same `drainTimeout`-bounded wind-down inside `LeasedWorkerRunner` — it just never marks the instance itself as draining.
 
 A workload doesn't have to depend on `IInstanceRegistry` to find out it should wrap up. If it
 implements `IDrainableService`, the runner calls `RequestDrain()` on it the instant drain mode is

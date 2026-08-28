@@ -59,7 +59,82 @@ internal class WorkloadCoordinatorHostedServiceTests
     }
 
     [Test]
-    public async Task WorkloadReassignedAway_WhileInstanceNotDraining_ShouldStopRunnerImmediately()
+    public async Task WorkloadReassignedAway_WhileInstanceNotDraining_ShouldLetItFinishNaturallyWithoutMarkingInstanceDraining()
+    {
+        var startedA = new TaskCompletionSource();
+        var startedB = new TaskCompletionSource();
+        var allowBToFinish = new TaskCompletionSource();
+        var bExecutions = 0;
+        var workloads = new List<TestWorkload> { new ("workload-a"), new ("workload-b") };
+
+        var coordinator = this.buildCoordinator(
+            workloads,
+            async (workload, ct) =>
+            {
+                if (workload.Key == "workload-a")
+                {
+                    startedA.TrySetResult();
+                    await Task.Delay(Timeout.Infinite, ct);
+                    return;
+                }
+
+                Interlocked.Increment(ref bExecutions);
+                startedB.TrySetResult();
+
+                // Deliberately does NOT observe ct - mirrors a workload (e.g. a game round) that
+                // runs its current cycle to natural completion regardless of a reassignment signal,
+                // only stopping cooperatively once it's actually done.
+                await allowBToFinish.Task;
+            });
+
+        await coordinator.StartAsync(CancellationToken.None);
+        try
+        {
+            // Both workloads land on the only active instance to start with.
+            await Task.WhenAll(
+                startedA.Task.WaitAsync(TimeSpan.FromSeconds(5)),
+                startedB.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+
+            // A second instance joins: with two workloads split across two instances,
+            // "workload-b" now belongs to "instance-b" and drops out of this instance's assignment.
+            this.instanceRegistry.ActiveInstanceIds = new[] { "instance-a", "instance-b" };
+
+            // Give the coordinator several reconcile ticks worth of time; the workload must be left
+            // running rather than force-stopped just because it's no longer assigned here.
+            await Task.Delay(TimeSpan.FromMilliseconds(150));
+            allowBToFinish.Task.IsCompleted.Should().BeFalse("the worker hasn't been told to finish yet");
+            this.instanceRegistry.IsDraining.Should().BeFalse(
+                "a plain rebalance away from a healthy instance must not drain the whole instance");
+
+            // Lease renewal must keep succeeding throughout, or another instance could acquire the
+            // same lease while this one is still finishing - a double-run hazard.
+            this.mockedLeaseManager.Invocations
+                .Count(i => i.Method.Name == nameof(ILeaseManager.TryAcquireOrRenewAsync) && (string)i.Arguments[0] == "workload-b")
+                .Should().BeGreaterThan(1, "the lease must still be renewed while the reassigned workload winds down");
+
+            allowBToFinish.SetResult();
+
+            await waitUntilAsync(
+                () => this.mockedLeaseManager.Invocations.Any(i =>
+                    i.Method.Name == nameof(ILeaseManager.ReleaseIfOwnedAsync) && (string)i.Arguments[0] == "workload-b"),
+                TimeSpan.FromSeconds(5));
+
+            this.instanceRegistry.IsDraining.Should().BeFalse();
+
+            // Give the coordinator a couple more ticks to prove it doesn't restart the workload on
+            // this instance now that it's finished (it belongs to "instance-b" going forward).
+            await Task.Delay(TimeSpan.FromMilliseconds(100));
+            bExecutions.Should().Be(1, "the reassigned workload must not be restarted on this instance once it finishes");
+        }
+        finally
+        {
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await coordinator.StopAsync(stopCts.Token);
+        }
+    }
+
+    [Test]
+    public async Task WorkloadReassignedAway_ShouldForceStopAfterDrainTimeout_WhenItNeverFinishesNaturally()
     {
         var startedA = new TaskCompletionSource();
         var startedB = new TaskCompletionSource();
@@ -85,19 +160,22 @@ internal class WorkloadCoordinatorHostedServiceTests
         await coordinator.StartAsync(CancellationToken.None);
         try
         {
-            // Both workloads land on the only active instance to start with.
             await Task.WhenAll(
                 startedA.Task.WaitAsync(TimeSpan.FromSeconds(5)),
                 startedB.Task.WaitAsync(TimeSpan.FromSeconds(5)));
 
-            // A second instance joins: with two workloads split across two instances,
-            // "workload-b" now belongs to "instance-b" and drops out of this instance's assignment.
             this.instanceRegistry.ActiveInstanceIds = new[] { "instance-a", "instance-b" };
 
+            // Not force-stopped immediately - it gets a chance to finish on its own first.
+            var stoppedEarly = await Task.WhenAny(bCancelled.Task, Task.Delay(TimeSpan.FromMilliseconds(300))) == bCancelled.Task;
+            stoppedEarly.Should().BeFalse("a reassigned workload must not be cancelled immediately");
+
+            // It never cooperates (ignores the reassignment entirely), so the drainTimeout ceiling
+            // must eventually force it to stop anyway.
             await bCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             this.instanceRegistry.IsDraining.Should().BeFalse(
-                "a plain rebalance away from a healthy instance must not drain the whole instance");
+                "forcing a stuck reassigned workload to stop still must not drain the whole instance");
         }
         finally
         {

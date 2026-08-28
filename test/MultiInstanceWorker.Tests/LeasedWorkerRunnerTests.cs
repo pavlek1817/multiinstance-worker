@@ -215,6 +215,94 @@ internal class LeasedWorkerRunnerTests
     }
 
     [Test]
+    public async Task WorkloadReassignment_WhileWorkerRunning_ShouldLetWorkerFinishNaturallyBeforeReleasingLease()
+    {
+        var renewCount = 0;
+        this.mockedLeaseManager
+            .Setup(x => x.TryAcquireOrRenewAsync("workload", "instance-a", LeaseTtl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() =>
+            {
+                Interlocked.Increment(ref renewCount);
+                return true;
+            });
+
+        var workerStarted = new TaskCompletionSource();
+        var allowWorkerToFinish = new TaskCompletionSource();
+        var drainable = new FakeDrainableService();
+        var runner = this.buildRunner(
+            async _ =>
+            {
+                workerStarted.TrySetResult();
+                await allowWorkerToFinish.Task;
+            },
+            drainable: drainable);
+
+        using var stoppingCts = new CancellationTokenSource();
+        using var shutdownCts = new CancellationTokenSource();
+        var runTask = runner.RunAsync(stoppingCts.Token, shutdownToken: shutdownCts.Token);
+
+        await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var renewCountAtReassignment = renewCount;
+        await stoppingCts.CancelAsync();
+
+        // Reassignment should signal the cooperative workload immediately...
+        await waitUntilAsync(() => drainable.DrainRequested, TimeSpan.FromSeconds(5));
+
+        // ...but must not tear down the in-flight worker, nor mark the whole instance draining -
+        // only this one workload was reassigned, the instance itself is still healthy.
+        await Task.Delay(TimeSpan.FromMilliseconds(100));
+        runTask.IsCompleted.Should().BeFalse("the worker is still finishing its own work and hasn't hit the drain timeout");
+        this.instanceRegistry.IsDraining.Should().BeFalse(
+            "cancelling the per-runner stoppingToken (workload reassignment) must not drain the instance");
+
+        // The lease must keep being renewed throughout, or another instance could acquire it while
+        // this one is still finishing up - a double-run hazard.
+        renewCount.Should().BeGreaterThan(renewCountAtReassignment, "the lease must still be renewed while the worker winds down");
+
+        allowWorkerToFinish.SetResult();
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        this.instanceRegistry.IsDraining.Should().BeFalse();
+        this.mockedLeaseManager.Verify(
+            x => x.ReleaseIfOwnedAsync("workload", "instance-a", It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Test]
+    public async Task WorkloadReassignment_WhenWorkerNeverFinishes_ShouldForciblyStopAfterDrainTimeout()
+    {
+        this.mockedLeaseManager
+            .Setup(x => x.TryAcquireOrRenewAsync("workload", "instance-a", LeaseTtl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var workerStarted = new TaskCompletionSource();
+        var runner = this.buildRunner(
+            ct =>
+            {
+                workerStarted.TrySetResult();
+                return Task.Delay(Timeout.Infinite, ct);
+            },
+            drainTimeout: TimeSpan.FromMilliseconds(50));
+
+        using var stoppingCts = new CancellationTokenSource();
+        using var shutdownCts = new CancellationTokenSource();
+        var runTask = runner.RunAsync(stoppingCts.Token, shutdownToken: shutdownCts.Token);
+
+        await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await stoppingCts.CancelAsync();
+
+        // The worker never finishes on its own, so once the drain timeout elapses the runner must
+        // cancel it forcibly instead of waiting forever - same ceiling as a real drain.
+        await runTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        this.instanceRegistry.IsDraining.Should().BeFalse(
+            "forcing a stuck reassigned workload to stop still must not drain the whole instance");
+        this.mockedLeaseManager.Verify(
+            x => x.ReleaseIfOwnedAsync("workload", "instance-a", It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Test]
     public async Task InstanceShutdown_WhenShutdownTokenCancelled_ShouldCallBeginDrainAsync()
     {
         // shutdownToken is the host-level token cancelled during instance shutdown; only that one
