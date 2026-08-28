@@ -272,8 +272,18 @@ internal class WorkloadCoordinatorHostedServiceTests
         // Mirrors the real Redis-backed registries: a draining instance excludes itself from its
         // own view of the active-instance set, same as it would be excluded from every other
         // instance's view.
-        public Task<string[]> GetActiveInstanceIdsAsync(CancellationToken ct)
-            => Task.FromResult(this.IsDraining ? Array.Empty<string>() : this.ActiveInstanceIds);
+        public Task<IReadOnlyCollection<ActiveInstance>> GetActiveInstancesAsync(CancellationToken ct)
+        {
+            var ids = this.IsDraining ? Array.Empty<string>() : this.ActiveInstanceIds;
+
+            // These tests only exercise BalancedNamedWorkloadAssigner, which ignores JoinedAtUtc,
+            // so a fixed value is fine here - there's nothing to assert about join order.
+            IReadOnlyCollection<ActiveInstance> activeInstances = ids
+                .Select(id => new ActiveInstance { InstanceId = id, JoinedAtUtc = DateTimeOffset.UnixEpoch })
+                .ToArray();
+
+            return Task.FromResult(activeInstances);
+        }
 
         public Task RemoveCurrentAsync(CancellationToken ct) => Task.CompletedTask;
     }

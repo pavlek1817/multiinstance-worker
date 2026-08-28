@@ -23,6 +23,12 @@ public record LeaderElectionConfig
     public int InstanceHeartbeatIntervalMs { get; init; }
 
     /// <summary>
+    /// How long a draining (or, under a coordinator, reassigned-away) workload is allowed to
+    /// finish on its own before it is force-cancelled.
+    /// </summary>
+    public int DrainTimeoutSeconds { get; init; }
+
+    /// <summary>
     /// Validates that all timing values are positive and that every renewal interval
     /// is shorter than the TTL it is meant to sustain.
     /// </summary>
@@ -38,6 +44,7 @@ public record LeaderElectionConfig
             this.InstanceHeartbeatIntervalMs,
             0,
             nameof(this.InstanceHeartbeatIntervalMs));
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(this.DrainTimeoutSeconds, 0, nameof(this.DrainTimeoutSeconds));
 
         if (this.LeaseRenewIntervalMs >= TimeSpan.FromSeconds(this.LeaseTtlSeconds).TotalMilliseconds)
         {

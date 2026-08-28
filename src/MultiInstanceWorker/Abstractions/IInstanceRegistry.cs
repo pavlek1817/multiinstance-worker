@@ -23,9 +23,10 @@ public interface IInstanceRegistry
     Task BeginDrainAsync(CancellationToken ct);
 
     /// <summary>
-    /// Returns the set of active, non-draining instance ids currently visible to the coordinator.
+    /// Returns the set of active, non-draining instances currently visible to the coordinator,
+    /// each with the time it first joined the registry.
     /// </summary>
-    Task<string[]> GetActiveInstanceIdsAsync(CancellationToken ct);
+    Task<IReadOnlyCollection<ActiveInstance>> GetActiveInstancesAsync(CancellationToken ct);
 
     /// <summary>Removes the current instance from the active-instance index.</summary>
     Task RemoveCurrentAsync(CancellationToken ct);

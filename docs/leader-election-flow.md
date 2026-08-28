@@ -16,8 +16,8 @@ flowchart TD
     A[Application host starts] --> B[ProcessInstanceIdentityProvider creates InstanceId]
     B --> C[Coordinator and leased hosted services start]
     C --> D[HeartbeatAsync writes the instance record to the store]
-    D --> E[GetActiveInstanceIdsAsync reads live instances]
-    E --> F[BalancedNamedWorkloadAssigner chooses local workloads]
+    D --> E[GetActiveInstancesAsync reads live instances, each with its join time]
+    E --> F[IWorkloadAssigner chooses local workloads]
     F --> G{Is this workload assigned here?}
     G -- No --> D
     G -- Yes --> H[LeasedWorkerRunner starts]
@@ -40,7 +40,7 @@ flowchart TD
 `ProcessInstanceIdentityProvider` gives each process a unique id. That id is used everywhere the instance needs to prove ownership.
 
 ### Instance registry
-A consumer's `IInstanceRegistry` implementation stores a heartbeat record with a TTL. A coordinator uses that list to know which instances are still active. (A Redis-backed example would write a keyed record with TTL and read back a secondary index of live keys; any store that supports expiring records and a membership query works.)
+A consumer's `IInstanceRegistry` implementation stores a heartbeat record with a TTL, plus a write-once join time captured the first time each instance id is ever seen (never touched by later heartbeat renewals). A coordinator uses that list - each entry an `ActiveInstance` with an `InstanceId` and `JoinedAtUtc` - to know which instances are still active, and how long each has been around. (A Redis-backed example would write a keyed record with TTL, a separate `NX`-guarded field for the join time, and read back a secondary index of live keys; any store that supports expiring records and a membership query works.)
 
 ### Lease manager
 A consumer's `ILeaseManager` implementation protects each named workload with mutual exclusion around a lease record — for example a short arbitration lock plus a read-then-write of the lease record. A lease can be renewed by the same owner, but not stolen by another owner before it expires.
@@ -56,7 +56,8 @@ A consumer's `ILeaseManager` implementation protects each named workload with mu
 
 ### Coordinator
 For workloads beyond a single singleton, `WorkloadCoordinatorHostedService<TWorkload>` keeps
-heartbeats alive, reads active instances, uses `BalancedNamedWorkloadAssigner` to decide which
+heartbeats alive, reads active instances, uses its `IWorkloadAssigner` (`BalancedNamedWorkloadAssigner`
+by default, or `PrimaryNodeWorkloadAssigner` for an active/passive topology) to decide which
 workloads belong to this instance, and reconciles one `LeasedWorkerRunner` per assigned workload —
 starting runners for newly assigned workloads and stopping ones that dropped out. Each runner gets
 its own `CancellationTokenSource`, independent of the coordinator's host token, and is driven with

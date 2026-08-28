@@ -16,7 +16,7 @@ namespace MultiInstanceWorker;
 /// <see cref="IDrainableService.RequestDrain"/> is invoked the moment drain mode is entered, so a
 /// cooperative workload can wrap up on its own well before <c>drainTimeout</c> would force it.
 /// </remarks>
-public sealed class LeasedWorkerRunner(
+internal sealed class LeasedWorkerRunner(
     ILogger logger,
     ILeaseManager leaseManager,
     IInstanceIdentityProvider instanceIdentityProvider,

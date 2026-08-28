@@ -1,16 +1,13 @@
 namespace MultiInstanceWorker.Sample.Api.Jobs;
 
 /// <summary>
-/// <see cref="LeaderElectionConfig"/> plus the drain-timeout ceiling that
-/// <see cref="LeasedWorkerHostedService"/> also needs, so the sample can bind all of its worker
-/// timing knobs from one "WorkerTiming" configuration section.
+/// <see cref="LeaderElectionConfig"/> (which already covers lease/heartbeat/drain timing) plus the
+/// one extra knob this sample needs, so it can bind all of its worker timing from one
+/// "WorkerTiming" configuration section.
 /// </summary>
 public sealed record WorkerTimingOptions : LeaderElectionConfig
 {
     public const string SectionName = "WorkerTiming";
-
-    /// <summary>How long a draining runner lets its worker finish on its own before force-cancelling it.</summary>
-    public int DrainTimeoutSeconds { get; init; }
 
     /// <summary>
     /// How long a job's Redis-backed execution stats (owner, tick count, last tick time) survive
@@ -24,7 +21,6 @@ public sealed record WorkerTimingOptions : LeaderElectionConfig
     {
         base.Validate();
 
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(this.DrainTimeoutSeconds, 0, nameof(this.DrainTimeoutSeconds));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(this.JobStatsTtlSeconds, 0, nameof(this.JobStatsTtlSeconds));
     }
 }

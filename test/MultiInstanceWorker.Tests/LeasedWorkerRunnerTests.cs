@@ -286,7 +286,8 @@ internal class LeasedWorkerRunnerTests
             return Task.CompletedTask;
         }
 
-        public Task<string[]> GetActiveInstanceIdsAsync(CancellationToken ct) => Task.FromResult(Array.Empty<string>());
+        public Task<IReadOnlyCollection<ActiveInstance>> GetActiveInstancesAsync(CancellationToken ct)
+            => Task.FromResult<IReadOnlyCollection<ActiveInstance>>(Array.Empty<ActiveInstance>());
 
         public Task RemoveCurrentAsync(CancellationToken ct) => Task.CompletedTask;
     }

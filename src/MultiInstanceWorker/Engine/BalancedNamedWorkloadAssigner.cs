@@ -3,19 +3,18 @@ namespace MultiInstanceWorker;
 /// <summary>
 /// Splits a set of named workloads evenly across the active instances, by sort order.
 /// </summary>
-public sealed class BalancedNamedWorkloadAssigner
+public sealed class BalancedNamedWorkloadAssigner : IWorkloadAssigner
 {
-    /// <summary>
-    /// Returns the slice of <paramref name="workloads"/> assigned to <paramref name="currentInstanceId"/>.
-    /// </summary>
+    /// <inheritdoc/>
     public IReadOnlyCollection<TWorkload> GetAssignedWorkloads<TWorkload>(
         IEnumerable<TWorkload> workloads,
         Func<TWorkload, string> keySelector,
-        IEnumerable<string> activeInstanceIds,
+        IEnumerable<ActiveInstance> activeInstances,
         string currentInstanceId)
     {
-        var orderedInstances = activeInstanceIds
-            .Distinct(StringComparer.Ordinal)
+        var orderedInstances = activeInstances
+            .Select(x => x.InstanceId)
+            .Distinct()
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
 
