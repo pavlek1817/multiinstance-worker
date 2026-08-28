@@ -7,7 +7,7 @@
         <Nullable>enable</Nullable>
         <IsPackable>true</IsPackable>
         <PackageId>MultiInstanceWorker</PackageId>
-        <Version>1.0.0</Version>
+        <Version>2.0.0</Version>
         <Authors>Mario Pavlović</Authors>
         <Company>PavMa</Company>
         <Description>Library for handling background workers in a multi-instance environment, handling autoscaling: provider-agnostic leader election, instance discovery, and balanced workload assignment for running singleton and sharded background workers across multiple application instances.</Description>
