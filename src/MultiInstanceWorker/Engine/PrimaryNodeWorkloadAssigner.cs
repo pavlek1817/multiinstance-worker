@@ -31,16 +31,16 @@ public sealed class PrimaryNodeWorkloadAssigner : IWorkloadAssigner
         var primary = activeInstances
             .DistinctBy(x => x.InstanceId)
             .OrderBy(x => x.JoinedAtUtc)
-            .ThenBy(x => x.InstanceId, StringComparer.Ordinal)
+            .ThenBy(x => x.InstanceId)
             .FirstOrDefault();
 
-        if (primary is null || !string.Equals(primary.InstanceId, currentInstanceId, StringComparison.Ordinal))
+        if (primary is null || primary.InstanceId != currentInstanceId)
         {
             return Array.Empty<TWorkload>();
         }
 
         return workloads
-            .OrderBy(keySelector, StringComparer.Ordinal)
+            .OrderBy(keySelector)
             .ToArray();
     }
 }

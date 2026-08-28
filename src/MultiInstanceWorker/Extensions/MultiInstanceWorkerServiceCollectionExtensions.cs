@@ -37,7 +37,7 @@ public static class MultiInstanceWorkerServiceCollectionExtensions
     /// Resolves the lease/heartbeat/drain timing for this workload from <see cref="IServiceProvider"/>
     /// - typically <c>sp =&gt; sp.GetRequiredService&lt;IOptions&lt;YourOptions&gt;&gt;().Value</c>,
     /// so it can come from the framework's options pattern rather than a value computed before the
-    /// container is built. <see cref="LeaderElectionConfig.InstanceHeartbeatTtlSeconds"/> and
+    /// container is built. <see cref="LeaderElectionConfig.InstanceHeartbeatTtlMs"/> and
     /// <see cref="LeaderElectionConfig.InstanceHeartbeatIntervalMs"/> are not used by a standalone
     /// <see cref="LeasedWorkerHostedService"/> (only <see cref="IInstanceRegistry"/>'s own
     /// implementation cares about those), but the same config type is accepted here so a consumer
@@ -76,9 +76,9 @@ public static class MultiInstanceWorkerServiceCollectionExtensions
                 sp.GetRequiredService<IInstanceRegistry>(),
                 workloadKey: workloadKey,
                 displayName: displayName,
-                leaseTtl: TimeSpan.FromSeconds(config.LeaseTtlSeconds),
+                leaseTtl: TimeSpan.FromMilliseconds(config.LeaseTtlMs),
                 renewInterval: TimeSpan.FromMilliseconds(config.LeaseRenewIntervalMs),
-                drainTimeout: TimeSpan.FromSeconds(config.DrainTimeoutSeconds),
+                drainTimeout: TimeSpan.FromMilliseconds(config.DrainTimeoutMs),
                 executeAsync: ct => executeAsync(sp, ct),
                 drainable: drainableSelector?.Invoke(sp));
         });
@@ -155,9 +155,9 @@ public static class MultiInstanceWorkerServiceCollectionExtensions
                 keySelector: keySelector,
                 displayNameSelector: displayNameSelector,
                 executeAsync: (workload, ct) => executeAsync(sp, workload, ct),
-                leaseTtl: TimeSpan.FromSeconds(config.LeaseTtlSeconds),
+                leaseTtl: TimeSpan.FromMilliseconds(config.LeaseTtlMs),
                 renewInterval: TimeSpan.FromMilliseconds(config.LeaseRenewIntervalMs),
-                drainTimeout: TimeSpan.FromSeconds(config.DrainTimeoutSeconds),
+                drainTimeout: TimeSpan.FromMilliseconds(config.DrainTimeoutMs),
                 heartbeatInterval: TimeSpan.FromMilliseconds(config.InstanceHeartbeatIntervalMs),
                 drainableSelector: drainableSelector is null ? null : workload => drainableSelector(sp, workload));
         });

@@ -178,11 +178,11 @@ internal sealed class TwoInstanceApiTests
                 ["Redis:KeyPrefix"] = keyPrefix,
 
                 // Fast timing so ownership, renewal, and drain all converge quickly in tests.
-                ["WorkerTiming:LeaseTtlSeconds"] = "2",
+                ["WorkerTiming:LeaseTtlMs"] = "2000",
                 ["WorkerTiming:LeaseRenewIntervalMs"] = "200",
-                ["WorkerTiming:InstanceHeartbeatTtlSeconds"] = "2",
+                ["WorkerTiming:InstanceHeartbeatTtlMs"] = "2000",
                 ["WorkerTiming:InstanceHeartbeatIntervalMs"] = "200",
-                ["WorkerTiming:DrainTimeoutSeconds"] = "5",
+                ["WorkerTiming:DrainTimeoutMs"] = "5000",
 
                 // The per-tick job logging is useful when debugging a run by hand, but at
                 // 250ms/tick across two instances and multiple tests it drowns out everything
