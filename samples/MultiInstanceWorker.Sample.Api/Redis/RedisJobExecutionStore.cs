@@ -21,6 +21,7 @@ public sealed class RedisJobExecutionStore(
     IConnectionMultiplexer connectionMultiplexer,
     IOptions<RedisOptions> options,
     TimeSpan statsTtl)
+    : IJobExecutionStore
 {
     // KEYS[1] = stats hash key, ARGV[1] = owner instance id, ARGV[2] = tick timestamp (unix ms).
     // Stamps the current owner/tick time, bumps the tick count, and refreshes the key's expiry in
@@ -36,15 +37,15 @@ public sealed class RedisJobExecutionStore(
 
     private readonly RedisOptions options = options.Value;
 
-    /// <summary>Records one tick for <paramref name="jobName"/> and returns the job's new total tick count.</summary>
-    public async Task<long> RecordTickAsync(string jobName, string ownerInstanceId, CancellationToken ct)
+    /// <inheritdoc/>
+    public async Task<long> RecordTickAsync(string jobKey, string ownerInstanceId, CancellationToken ct)
     {
         var db = connectionMultiplexer.GetDatabase();
         var result = await db.ScriptEvaluateAsync(
             RecordTickScript,
             new
             {
-                statsKey = this.buildStatsKey(jobName),
+                statsKey = this.buildStatsKey(jobKey),
                 ownerId = ownerInstanceId,
                 tickAtUtc = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 ttlMs = (long)statsTtl.TotalMilliseconds,
@@ -53,43 +54,33 @@ public sealed class RedisJobExecutionStore(
         return (long)result;
     }
 
-    /// <summary>Reads the current stats for each of <paramref name="jobNames"/>, in parallel.</summary>
-    public async Task<IReadOnlyCollection<JobExecutionStats>> GetAllAsync(IEnumerable<string> jobNames, CancellationToken ct)
+    /// <inheritdoc/>
+    public async Task<IReadOnlyCollection<JobExecutionStats>> GetAllAsync(IEnumerable<string> jobKeys, CancellationToken ct)
     {
         var db = connectionMultiplexer.GetDatabase();
-        var snapshots = await Task.WhenAll(jobNames.Select(jobName => this.getOneAsync(db, jobName, ct)));
+        var snapshots = await Task.WhenAll(jobKeys.Select(jobKey => this.getOneAsync(db, jobKey, ct)));
         return snapshots;
     }
 
-    private async Task<JobExecutionStats> getOneAsync(IDatabase db, string jobName, CancellationToken ct)
+    private async Task<JobExecutionStats> getOneAsync(IDatabase db, string jobKey, CancellationToken ct)
     {
-        var entries = await db.HashGetAllAsync(this.buildStatsKey(jobName)).WaitAsync(ct);
+        var entries = await db.HashGetAllAsync(this.buildStatsKey(jobKey)).WaitAsync(ct);
         if (entries.Length == 0)
         {
             // No tick has ever been recorded for this job (or its stats expired) - nobody's
             // currently claimed it as far as this store is concerned.
-            return new JobExecutionStats(jobName, ownerInstanceId: null, tickCount: 0, lastTickAtUtc: null);
+            return new JobExecutionStats { JobKey = jobKey, OwnerInstanceId = null, TickCount = 0, LastTickAtUtc = null };
         }
 
         var hash = entries.ToDictionary(e => (string)e.Name!, e => e.Value, StringComparer.Ordinal);
-        return new JobExecutionStats(
-            jobName,
-            ownerInstanceId: (string?)hash["owner"],
-            tickCount: (long)hash["tickCount"],
-            lastTickAtUtc: DateTimeOffset.FromUnixTimeMilliseconds((long)hash["lastTickAtUtc"]));
+        return new JobExecutionStats
+        {
+            JobKey = jobKey,
+            OwnerInstanceId = (string?)hash["owner"],
+            TickCount = (long)hash["tickCount"],
+            LastTickAtUtc = DateTimeOffset.FromUnixTimeMilliseconds((long)hash["lastTickAtUtc"]),
+        };
     }
 
-    private RedisKey buildStatsKey(string jobName) => $"{this.options.KeyPrefix}:job:{jobName}:stats";
-}
-
-/// <summary>Point-in-time execution state for one job, as currently recorded in Redis.</summary>
-public sealed class JobExecutionStats(string jobName, string? ownerInstanceId, long tickCount, DateTimeOffset? lastTickAtUtc)
-{
-    public string JobName { get; } = jobName;
-
-    public string? OwnerInstanceId { get; } = ownerInstanceId;
-
-    public long TickCount { get; } = tickCount;
-
-    public DateTimeOffset? LastTickAtUtc { get; } = lastTickAtUtc;
+    private RedisKey buildStatsKey(string jobKey) => $"{this.options.KeyPrefix}:job:{jobKey}:stats";
 }

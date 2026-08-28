@@ -1,14 +1,12 @@
-using MultiInstanceWorker.Sample.Api.Redis;
-
 namespace MultiInstanceWorker.Sample.Api.Jobs;
 
 /// <summary>
-/// Reads and writes each job's live execution state through <see cref="RedisJobExecutionStore"/>,
-/// so <c>/diagnostics</c> shows the same fleet-wide view - current owner, total ticks, last tick
+/// Reads and writes each job's live execution state through <see cref="IJobExecutionStore"/>, so
+/// <c>/diagnostics</c> shows the same fleet-wide view - current owner, total ticks, last tick
 /// time - no matter which instance answers the request, instead of each instance only knowing
 /// about jobs it happens to run itself.
 /// </summary>
-public sealed class JobExecutionTracker(RedisJobExecutionStore store, IInstanceIdentityProvider instanceIdentityProvider)
+public sealed class JobExecutionTracker(IJobExecutionStore store, IInstanceIdentityProvider instanceIdentityProvider)
 {
     /// <summary>Records one tick for <paramref name="jobName"/> on this instance and returns the job's new total tick count.</summary>
     public Task<long> RecordTickAsync(string jobName, CancellationToken ct) =>
@@ -20,7 +18,7 @@ public sealed class JobExecutionTracker(RedisJobExecutionStore store, IInstanceI
 
         return stats
             .Select(s => new JobSnapshot(
-                s.JobName,
+                s.JobKey,
                 s.OwnerInstanceId,
                 isRunningHere: s.OwnerInstanceId == instanceIdentityProvider.InstanceId,
                 s.TickCount,

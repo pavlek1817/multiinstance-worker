@@ -22,6 +22,13 @@ builder.Services
         },
         "Invalid WorkerTiming configuration.");
 
+// RedisInstanceRegistry only needs the lease/heartbeat/drain timing, so it depends on the core
+// LeaderElectionConfig rather than the sample-specific WorkerTimingOptions - bound from the same
+// "WorkerTiming" section so both option types stay in sync.
+builder.Services
+    .AddOptions<LeaderElectionConfig>()
+    .Bind(builder.Configuration.GetSection(WorkerTimingOptions.SectionName));
+
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 {
     var redisOptions = sp.GetRequiredService<IOptions<RedisOptions>>().Value;
@@ -29,61 +36,48 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 });
 
 // The core package is provider-agnostic - it does not know about Redis. These two adapters are
-// what a consuming application supplies itself, per the README.
-builder.Services.AddSingleton<IInstanceIdentityProvider, ProcessInstanceIdentityProvider>();
+// what a consuming application supplies itself, per the README. (IInstanceIdentityProvider isn't
+// listed here: AddWorkloadCoordinator below defaults it to the stock ProcessInstanceIdentityProvider
+// via TryAdd, and nothing in this sample needs a custom one.)
 builder.Services.AddSingleton<ILeaseManager, RedisLeaseManager>();
-builder.Services.AddSingleton<IInstanceRegistry>(sp => new RedisInstanceRegistry(
-    sp.GetRequiredService<IConnectionMultiplexer>(),
-    sp.GetRequiredService<IOptions<RedisOptions>>(),
-    sp.GetRequiredService<IInstanceIdentityProvider>(),
-    TimeSpan.FromSeconds(sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value.InstanceHeartbeatTtlSeconds)));
+builder.Services.AddSingleton<IInstanceRegistry, RedisInstanceRegistry>();
 
-builder.Services.AddSingleton(sp => new RedisJobExecutionStore(
+builder.Services.AddSingleton<IJobExecutionStore>(sp => new RedisJobExecutionStore(
     sp.GetRequiredService<IConnectionMultiplexer>(),
     sp.GetRequiredService<IOptions<RedisOptions>>(),
     TimeSpan.FromSeconds(sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value.JobStatsTtlSeconds)));
 builder.Services.AddSingleton<JobExecutionTracker>();
-builder.Services.AddSingleton<BalancedNamedWorkloadAssigner>();
 
-// A single coordinator hosted service replaces one LeasedWorkerHostedService per job: instead of
-// each job racing independently for its own lease (whichever instance gets there first keeps it
-// forever, so nothing stops one instance from ending up with every job), the coordinator
-// heartbeats, asks BalancedNamedWorkloadAssigner for this instance's even-split slice of
-// JobCatalog.All on every tick, and reconciles local LeasedWorkerRunners to match. It also
-// subsumes what the sample's old standalone HeartbeatHostedService did (heartbeat + remove-on-
-// shutdown), so that service is no longer registered.
-builder.Services.AddSingleton<IHostedService>(sp =>
+// One SampleWorkerJob per catalog entry, reused for the app's lifetime: each is both the workload
+// (executeAsync) and the coordinator's cooperative drain target (drainable) for its job, so
+// RequestDrain and the ticking loop always share the same drain flag even as the coordinator
+// starts and stops the runner across reassignments. Registered as a singleton so every
+// AddWorkloadCoordinator delegate call below resolves the same cached dictionary.
+builder.Services.AddSingleton<IReadOnlyDictionary<string, SampleWorkerJob>>(sp =>
 {
-    var timing = sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value;
     var tracker = sp.GetRequiredService<JobExecutionTracker>();
     var identity = sp.GetRequiredService<IInstanceIdentityProvider>();
     var jobLogger = sp.GetRequiredService<ILogger<SampleWorkerJob>>();
 
-    // One SampleWorkerJob per catalog entry, reused for the app's lifetime: each is both the
-    // workload (executeAsync) and the coordinator's cooperative drain target (drainable) for its
-    // job, so RequestDrain and the ticking loop always share the same drain flag even as the
-    // coordinator starts and stops the runner across reassignments.
-    var jobsByWorkloadKey = JobCatalog.All.ToDictionary(
+    return JobCatalog.All.ToDictionary(
         job => job.WorkloadKey,
         job => new SampleWorkerJob(job.Name, tracker, identity, jobLogger));
-
-    return new WorkloadCoordinatorHostedService<JobCatalog.JobDefinition>(
-        sp.GetRequiredService<ILogger<WorkloadCoordinatorHostedService<JobCatalog.JobDefinition>>>(),
-        sp.GetRequiredService<ILoggerFactory>(),
-        sp.GetRequiredService<IInstanceRegistry>(),
-        identity,
-        sp.GetRequiredService<ILeaseManager>(),
-        sp.GetRequiredService<BalancedNamedWorkloadAssigner>(),
-        JobCatalog.All,
-        keySelector: job => job.WorkloadKey,
-        displayNameSelector: job => job.DisplayName,
-        executeAsync: (job, ct) => jobsByWorkloadKey[job.WorkloadKey].RunAsync(ct),
-        leaseTtl: TimeSpan.FromSeconds(timing.LeaseTtlSeconds),
-        renewInterval: TimeSpan.FromMilliseconds(timing.LeaseRenewIntervalMs),
-        drainTimeout: TimeSpan.FromSeconds(timing.DrainTimeoutSeconds),
-        heartbeatInterval: TimeSpan.FromMilliseconds(timing.InstanceHeartbeatIntervalMs),
-        drainableSelector: job => jobsByWorkloadKey[job.WorkloadKey]);
 });
+
+// A single coordinator hosted service replaces one LeasedWorkerHostedService per job: instead of
+// each job racing independently for its own lease (whichever instance gets there first keeps it
+// forever, so nothing stops one instance from ending up with every job), the coordinator
+// heartbeats, asks its IWorkloadAssigner for this instance's slice of JobCatalog.All on every
+// tick, and reconciles local LeasedWorkerRunners to match. It also subsumes what the sample's old
+// standalone HeartbeatHostedService did (heartbeat + remove-on-shutdown), so that service is no
+// longer registered.
+builder.Services.AddWorkloadCoordinator(
+    JobCatalog.All,
+    keySelector: job => job.WorkloadKey,
+    displayNameSelector: job => job.DisplayName,
+    executeAsync: (sp, job, ct) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey].RunAsync(ct),
+    configFactory: sp => sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value,
+    drainableSelector: (sp, job) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey]);
 
 var app = builder.Build();
 
@@ -99,7 +93,10 @@ app.MapGet("/diagnostics", async (IInstanceRegistry instanceRegistry, JobExecuti
 });
 
 app.MapGet("/instances", async (IInstanceRegistry instanceRegistry, CancellationToken ct) =>
-    Results.Ok(await instanceRegistry.GetActiveInstanceIdsAsync(ct)));
+{
+    var activeInstances = await instanceRegistry.GetActiveInstancesAsync(ct);
+    return Results.Ok(activeInstances.Select(x => x.InstanceId));
+});
 
 // Lets a test (or an operator) trigger this instance's drain without tearing down the whole
 // host, demonstrating the "operator-triggered drain ahead of downsizing" case from the README.

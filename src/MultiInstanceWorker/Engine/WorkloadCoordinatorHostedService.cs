@@ -10,21 +10,50 @@ namespace MultiInstanceWorker;
 /// <remarks>
 /// This is the generic sharded-workload counterpart to <see cref="LeasedWorkerHostedService"/>
 /// (which handles a single singleton workload). On each tick it renews this instance's heartbeat,
-/// asks <see cref="BalancedNamedWorkloadAssigner"/> which of <paramref name="workloads"/> belong
-/// here, and reconciles local <see cref="LeasedWorkerRunner"/> instances against that assignment —
-/// starting runners for newly assigned workloads and stopping ones that are no longer owned.
+/// asks the <see cref="IWorkloadAssigner"/> which of <paramref name="workloads"/> belong here, and
+/// reconciles local <see cref="LeasedWorkerRunner"/> instances against that assignment — starting
+/// runners for newly assigned workloads and stopping ones that are no longer owned.
 /// <para/>
 /// Workload construction and execution stay entirely in <paramref name="executeAsync"/>, supplied
 /// by the consumer — this class knows nothing about what a workload actually does.
 /// </remarks>
 /// <typeparam name="TWorkload">The consumer-defined workload descriptor type.</typeparam>
+/// <param name="logger">Logger for this coordinator's own start/stop/assignment events.</param>
+/// <param name="loggerFactory">
+/// Used to create a logger for each per-workload <see cref="LeasedWorkerRunner"/> this coordinator
+/// starts, since those aren't resolved from DI individually.
+/// </param>
+/// <param name="instanceRegistry">Tracks this instance's heartbeat, drain state, and the active-instance set the assigner divides workloads across.</param>
+/// <param name="instanceIdentityProvider">This process's unique instance id, used to prove lease/heartbeat ownership.</param>
+/// <param name="leaseManager">Grants each assigned workload's lease to exactly one instance at a time.</param>
+/// <param name="workloadAssigner">
+/// Decides which of <paramref name="workloads"/> belong to this instance on each tick (e.g.
+/// <see cref="BalancedNamedWorkloadAssigner"/> or <see cref="PrimaryNodeWorkloadAssigner"/>). This
+/// is a liveness/efficiency decision, not the safety mechanism - <paramref name="leaseManager"/>
+/// still enforces exclusive ownership underneath it.
+/// </param>
+/// <param name="workloads">The full, static catalog of workloads this coordinator divides up across instances.</param>
+/// <param name="keySelector">Extracts each workload's unique, stable key (used as its lease key and runner identity).</param>
+/// <param name="displayNameSelector">Extracts each workload's human-readable name, for logs.</param>
+/// <param name="executeAsync">Runs one assigned workload for as long as this instance owns its lease.</param>
+/// <param name="leaseTtl">How long a workload's lease remains valid before another instance can take it over.</param>
+/// <param name="renewInterval">How often the owning instance renews each workload's lease.</param>
+/// <param name="drainTimeout">
+/// How long a draining or reassigned-away workload is allowed to finish on its own before this
+/// coordinator force-cancels it.
+/// </param>
+/// <param name="heartbeatInterval">How often this coordinator refreshes the instance heartbeat and re-evaluates the assignment.</param>
+/// <param name="drainableSelector">
+/// Optional: resolves the <see cref="IDrainableService"/> for a workload, if it has one, so it
+/// receives <see cref="IDrainableService.RequestDrain"/> the moment its runner enters drain mode.
+/// </param>
 public sealed class WorkloadCoordinatorHostedService<TWorkload>(
     ILogger<WorkloadCoordinatorHostedService<TWorkload>> logger,
     ILoggerFactory loggerFactory,
     IInstanceRegistry instanceRegistry,
     IInstanceIdentityProvider instanceIdentityProvider,
     ILeaseManager leaseManager,
-    BalancedNamedWorkloadAssigner workloadAssigner,
+    IWorkloadAssigner workloadAssigner,
     IReadOnlyCollection<TWorkload> workloads,
     Func<TWorkload, string> keySelector,
     Func<TWorkload, string> displayNameSelector,
@@ -52,7 +81,7 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
             {
                 await instanceRegistry.HeartbeatAsync(stoppingToken);
 
-                var activeInstances = await instanceRegistry.GetActiveInstanceIdsAsync(stoppingToken);
+                var activeInstances = await instanceRegistry.GetActiveInstancesAsync(stoppingToken);
                 var assignedWorkloads = workloadAssigner.GetAssignedWorkloads(
                     workloads,
                     keySelector,

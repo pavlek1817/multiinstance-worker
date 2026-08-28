@@ -9,10 +9,11 @@ internal class LeaderElectionConfigTests
     {
         var config = new LeaderElectionConfig
         {
-            LeaseTtlSeconds = 30,
+            LeaseTtlMs = 30000,
             LeaseRenewIntervalMs = 10000,
-            InstanceHeartbeatTtlSeconds = 30,
+            InstanceHeartbeatTtlMs = 30000,
             InstanceHeartbeatIntervalMs = 10000,
+            DrainTimeoutMs = 30000,
         };
 
         var act = () => config.Validate();
@@ -22,14 +23,15 @@ internal class LeaderElectionConfigTests
 
     [TestCase(0)]
     [TestCase(-1)]
-    public void LeaseTtlSecondsLessThanOrEqualZeroCase_ShouldThrow(int invalidLeaseTtlSeconds)
+    public void LeaseTtlMsLessThanOrEqualZeroCase_ShouldThrow(int invalidLeaseTtlMs)
     {
         var config = new LeaderElectionConfig
         {
-            LeaseTtlSeconds = invalidLeaseTtlSeconds,
+            LeaseTtlMs = invalidLeaseTtlMs,
             LeaseRenewIntervalMs = 10000,
-            InstanceHeartbeatTtlSeconds = 30,
+            InstanceHeartbeatTtlMs = 30000,
             InstanceHeartbeatIntervalMs = 10000,
+            DrainTimeoutMs = 30000,
         };
 
         var act = () => config.Validate();
@@ -42,10 +44,11 @@ internal class LeaderElectionConfigTests
     {
         var config = new LeaderElectionConfig
         {
-            LeaseTtlSeconds = 30,
+            LeaseTtlMs = 30000,
             LeaseRenewIntervalMs = 30000,
-            InstanceHeartbeatTtlSeconds = 30,
+            InstanceHeartbeatTtlMs = 30000,
             InstanceHeartbeatIntervalMs = 10000,
+            DrainTimeoutMs = 30000,
         };
 
         var act = () => config.Validate();
@@ -58,10 +61,29 @@ internal class LeaderElectionConfigTests
     {
         var config = new LeaderElectionConfig
         {
-            LeaseTtlSeconds = 30,
+            LeaseTtlMs = 30000,
             LeaseRenewIntervalMs = 10000,
-            InstanceHeartbeatTtlSeconds = 30,
+            InstanceHeartbeatTtlMs = 30000,
             InstanceHeartbeatIntervalMs = 30000,
+            DrainTimeoutMs = 30000,
+        };
+
+        var act = () => config.Validate();
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [TestCase(0)]
+    [TestCase(-1)]
+    public void DrainTimeoutMsLessThanOrEqualZeroCase_ShouldThrow(int invalidDrainTimeoutMs)
+    {
+        var config = new LeaderElectionConfig
+        {
+            LeaseTtlMs = 30000,
+            LeaseRenewIntervalMs = 10000,
+            InstanceHeartbeatTtlMs = 30000,
+            InstanceHeartbeatIntervalMs = 10000,
+            DrainTimeoutMs = invalidDrainTimeoutMs,
         };
 
         var act = () => config.Validate();
