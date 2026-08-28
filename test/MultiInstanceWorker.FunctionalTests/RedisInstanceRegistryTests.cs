@@ -129,7 +129,7 @@ internal sealed class RedisInstanceRegistryTests
         this.connectionMultiplexer,
         Options.Create(this.options),
         new FixedInstanceIdentityProvider(instanceId),
-        heartbeatTtl);
+        Options.Create(new LeaderElectionConfig { InstanceHeartbeatTtlMs = (int)heartbeatTtl.TotalMilliseconds }));
 
     private sealed class FixedInstanceIdentityProvider(string instanceId)
         : IInstanceIdentityProvider

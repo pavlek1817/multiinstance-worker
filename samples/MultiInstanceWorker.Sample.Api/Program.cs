@@ -22,6 +22,13 @@ builder.Services
         },
         "Invalid WorkerTiming configuration.");
 
+// RedisInstanceRegistry only needs the lease/heartbeat/drain timing, so it depends on the core
+// LeaderElectionConfig rather than the sample-specific WorkerTimingOptions - bound from the same
+// "WorkerTiming" section so both option types stay in sync.
+builder.Services
+    .AddOptions<LeaderElectionConfig>()
+    .Bind(builder.Configuration.GetSection(WorkerTimingOptions.SectionName));
+
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 {
     var redisOptions = sp.GetRequiredService<IOptions<RedisOptions>>().Value;
@@ -33,13 +40,9 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 // listed here: AddWorkloadCoordinator below defaults it to the stock ProcessInstanceIdentityProvider
 // via TryAdd, and nothing in this sample needs a custom one.)
 builder.Services.AddSingleton<ILeaseManager, RedisLeaseManager>();
-builder.Services.AddSingleton<IInstanceRegistry>(sp => new RedisInstanceRegistry(
-    sp.GetRequiredService<IConnectionMultiplexer>(),
-    sp.GetRequiredService<IOptions<RedisOptions>>(),
-    sp.GetRequiredService<IInstanceIdentityProvider>(),
-    TimeSpan.FromSeconds(sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value.InstanceHeartbeatTtlSeconds)));
+builder.Services.AddSingleton<IInstanceRegistry, RedisInstanceRegistry>();
 
-builder.Services.AddSingleton(sp => new RedisJobExecutionStore(
+builder.Services.AddSingleton<IJobExecutionStore>(sp => new RedisJobExecutionStore(
     sp.GetRequiredService<IConnectionMultiplexer>(),
     sp.GetRequiredService<IOptions<RedisOptions>>(),
     TimeSpan.FromSeconds(sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value.JobStatsTtlSeconds)));

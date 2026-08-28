@@ -65,6 +65,13 @@ consuming application supplies that by implementing two small interfaces.
 - `LeaderElectionConfig` — timing knobs (lease TTL / renew interval, heartbeat TTL /
   interval, drain timeout) with validation that renewal intervals stay safely inside
   their TTLs.
+- `IJobExecutionStore` — another optional contract, alongside `IDrainableService`: lets a
+  workload record its own ticks (`RecordTickAsync`) and lets anything - a diagnostics
+  endpoint, say - read the fleet-wide execution state of every job (`GetAllAsync`),
+  regardless of which instance answers. Nothing in this package calls it; a workload's
+  own `executeAsync` resolves it from DI and calls it on its own terms, since this
+  package has no opinion on what a "tick" means for any given workload. The sample app's
+  `RedisJobExecutionStore` is a real implementation.
 - `AddLeasedWorker` / `AddWorkloadCoordinator<TWorkload>` — `IServiceCollection`
   extensions that register the two hosted services above without hand-writing their
   constructor wiring (see Usage sketch below). Both default

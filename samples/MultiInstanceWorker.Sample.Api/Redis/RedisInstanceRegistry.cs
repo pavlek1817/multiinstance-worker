@@ -24,11 +24,11 @@ public sealed class RedisInstanceRegistry : IInstanceRegistry
         IConnectionMultiplexer connectionMultiplexer,
         IOptions<RedisOptions> options,
         IInstanceIdentityProvider instanceIdentityProvider,
-        TimeSpan heartbeatTtl)
+        IOptions<LeaderElectionConfig> timingOptions)
     {
         this.connectionMultiplexer = connectionMultiplexer;
         this.options = options.Value;
-        this.heartbeatTtl = heartbeatTtl;
+        this.heartbeatTtl = TimeSpan.FromMilliseconds(timingOptions.Value.InstanceHeartbeatTtlMs);
         this.InstanceId = instanceIdentityProvider.InstanceId;
     }
 
