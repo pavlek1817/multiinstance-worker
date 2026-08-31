@@ -2,8 +2,10 @@ namespace MultiInstanceWorker.Sample.Api.Jobs;
 
 /// <summary>
 /// The workload body handed to <see cref="WorkloadCoordinatorHostedService{TWorkload}"/> for each
-/// of the sample's two jobs. It doesn't do anything domain-specific - it just ticks on an interval
-/// and records that it did, so <c>/diagnostics</c> can show which instance is currently running it.
+/// of the sample's jobs. It doesn't do anything domain-specific - it just ticks on an interval.
+/// Which instance is currently running it, and its status, are already visible fleet-wide through
+/// <see cref="IWorkloadStatusStore"/> (written automatically by <see cref="LeasedWorkerRunner"/>
+/// itself) - this job doesn't need to record anything of its own for <c>/diagnostics</c> to show that.
 /// </summary>
 /// <remarks>
 /// Deliberately doesn't depend on <see cref="IInstanceRegistry"/> - that's a leader-election
@@ -13,11 +15,7 @@ namespace MultiInstanceWorker.Sample.Api.Jobs;
 /// result, so <see cref="RequestDrain"/> gets called for it automatically when its runner enters
 /// drain mode.
 /// </remarks>
-public sealed class SampleWorkerJob(
-    string jobName,
-    JobExecutionTracker tracker,
-    IInstanceIdentityProvider instanceIdentityProvider,
-    ILogger logger)
+public sealed class SampleWorkerJob(string jobName, IInstanceIdentityProvider instanceIdentityProvider, ILogger logger)
     : IDrainableService
 {
     private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(250);
@@ -46,12 +44,7 @@ public sealed class SampleWorkerJob(
                     break;
                 }
 
-                // Written straight through to Redis (owner, tick count, last tick time) so
-                // /diagnostics on either instance sees the same fleet-wide state for this job,
-                // not just what happened to run locally.
-                var tickCount = await tracker.RecordTickAsync(jobName, ct);
-                SampleWorkerJobLog.Tick(logger, jobName, tickCount, instanceIdentityProvider.InstanceId);
-
+                SampleWorkerJobLog.Tick(logger, jobName, instanceIdentityProvider.InstanceId);
                 await Task.Delay(TickInterval, ct);
             }
         }

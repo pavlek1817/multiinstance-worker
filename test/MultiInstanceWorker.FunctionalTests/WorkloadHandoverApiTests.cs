@@ -7,7 +7,6 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
-using MultiInstanceWorker.Sample.Api.Jobs;
 using MultiInstanceWorker.Sample.Api.Redis;
 using StackExchange.Redis;
 
@@ -17,10 +16,12 @@ namespace MultiInstanceWorker.FunctionalTests;
 /// Reproduces the scenario this whole handover mechanism exists for: one instance running two
 /// workloads, a second instance joining, and one of the two workloads needing to move across - but
 /// only once its current, uninterruptible unit of work actually finishes. Uses its own pair of
-/// workloads (not <see cref="JobCatalog"/>'s) registered directly on the test's own
+/// workloads (not <c>JobCatalog</c>'s) registered directly on the test's own
 /// <see cref="WebApplicationFactory{TEntryPoint}"/>, specifically so one of them can take several
 /// real seconds per unit of work without slowing down every other functional test that boots the
-/// sample app.
+/// sample app. Observes ownership straight through <see cref="IWorkloadStatusStore"/> - the same
+/// store <c>LeasedWorkerRunner</c> writes to on its own, so nothing in this test's workload bodies
+/// needs to record anything itself.
 /// </summary>
 internal sealed class WorkloadHandoverApiTests
 {
@@ -36,7 +37,7 @@ internal sealed class WorkloadHandoverApiTests
 
     private string keyPrefix = null!;
     private IConnectionMultiplexer connectionMultiplexer = null!;
-    private RedisJobExecutionStore executionStore = null!;
+    private RedisWorkloadStatusStore statusStore = null!;
     private HandoverApiFactory? instanceA;
     private HandoverApiFactory? instanceB;
     private HttpClient? clientA;
@@ -48,12 +49,12 @@ internal sealed class WorkloadHandoverApiTests
         this.keyPrefix = $"test-{Guid.NewGuid():N}";
         this.connectionMultiplexer = ConnectionMultiplexer.Connect(RedisTestFixture.ConnectionString);
 
-        // Reads only - the running instances write through their own DI-registered IJobExecutionStore,
-        // this is just how the test observes the same Redis-backed state from outside the app.
-        this.executionStore = new RedisJobExecutionStore(
+        // Reads only - the running instances' own LeasedWorkerRunner writes through its DI-registered
+        // IWorkloadStatusStore; this is just how the test observes that same Redis-backed state from
+        // outside the app.
+        this.statusStore = new RedisWorkloadStatusStore(
             this.connectionMultiplexer,
-            Options.Create(new RedisOptions { KeyPrefix = this.keyPrefix }),
-            statsTtl: TimeSpan.FromMinutes(5));
+            Options.Create(new RedisOptions { KeyPrefix = this.keyPrefix }));
     }
 
     [TearDown]
@@ -117,34 +118,20 @@ internal sealed class WorkloadHandoverApiTests
         return health?.InstanceId ?? throw new InvalidOperationException("/health returned an empty body.");
     }
 
-    private static async Task runHandoverWorkloadAsync(IServiceProvider sp, string workloadKey, CancellationToken ct)
-    {
-        var store = sp.GetRequiredService<IJobExecutionStore>();
-        var instanceId = sp.GetRequiredService<IInstanceIdentityProvider>().InstanceId;
-
-        while (!ct.IsCancellationRequested)
-        {
-            await store.RecordTickAsync(workloadKey, instanceId, ct);
-
-            if (workloadKey == SlowWorkloadKey)
-            {
-                // Deliberately NOT passed `ct` - a single unit of work that must run to completion
-                // once started, mirroring a job that can't be safely chopped up mid-flight. This is
-                // what gives the test a reliable window in which to observe "reassigned, but still
-                // finishing here".
-                await Task.Delay(SlowUnitOfWork);
-            }
-            else
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(200), ct);
-            }
-        }
-    }
+    // Deliberately NOT passed `ct` for the slow workload - a single unit of work that must run to
+    // completion once started, mirroring a job that can't be safely chopped up mid-flight. This is
+    // what gives the test a reliable window in which to observe "reassigned, but still finishing
+    // here". LeasedWorkerRunner keeps the lease renewed and the WorkloadStatus at Transferring
+    // throughout, regardless of what this workload body does.
+    private static Task runHandoverWorkloadAsync(IServiceProvider sp, string workloadKey, CancellationToken ct) =>
+        workloadKey == SlowWorkloadKey
+            ? Task.Delay(SlowUnitOfWork)
+            : Task.Delay(Timeout.Infinite, ct);
 
     private async Task<string?> ownerAsync(string workloadKey)
     {
-        var stats = await this.executionStore.GetAllAsync(new[] { workloadKey }, CancellationToken.None);
-        return stats.Single().OwnerInstanceId;
+        var statuses = await this.statusStore.GetStatusesAsync(new[] { workloadKey }, CancellationToken.None);
+        return statuses.TryGetValue(workloadKey, out var record) ? record.OwnerInstanceId : null;
     }
 
     private async Task waitUntilAsync(Func<Task<bool>> condition)
@@ -197,7 +184,6 @@ internal sealed class WorkloadHandoverApiTests
                 ["WorkerTiming:InstanceHeartbeatTtlMs"] = "1000",
                 ["WorkerTiming:InstanceHeartbeatIntervalMs"] = "100",
                 ["WorkerTiming:DrainTimeoutMs"] = "5000",
-                ["WorkerTiming:JobStatsTtlSeconds"] = "300",
                 ["Logging:LogLevel:MultiInstanceWorker"] = "Warning",
             }));
 
@@ -211,7 +197,7 @@ internal sealed class WorkloadHandoverApiTests
                 keySelector: key => key,
                 displayNameSelector: key => key,
                 executeAsync: runHandoverWorkloadAsync,
-                configFactory: sp => sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value));
+                configFactory: sp => sp.GetRequiredService<IOptions<LeaderElectionConfig>>().Value));
         }
     }
 }

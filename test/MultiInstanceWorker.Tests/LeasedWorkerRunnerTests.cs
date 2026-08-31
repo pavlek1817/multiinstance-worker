@@ -160,6 +160,11 @@ internal class LeasedWorkerRunnerTests
 
         var workerStarted = new TaskCompletionSource();
         var drainable = new FakeDrainableService();
+
+        // drainTimeout is short and irrelevant to what this test actually checks (RequestDrain
+        // firing immediately): the worker only observes cancellation via the runner's own
+        // force-cancel at the drainTimeout boundary, so leaving this at the 5s default raced
+        // runTask's completion against this test's own 5s WaitAsync budget below with no real margin.
         var runner = this.buildRunner(
             async ct =>
             {
@@ -172,10 +177,6 @@ internal class LeasedWorkerRunnerTests
                 {
                 }
             },
-            // Short and irrelevant to what this test actually checks (RequestDrain firing
-            // immediately): the worker only observes cancellation via the runner's own force-cancel
-            // at the drainTimeout boundary, so leaving this at the 5s default raced runTask's
-            // completion against this test's own 5s WaitAsync budget below with no real margin.
             drainTimeout: TimeSpan.FromMilliseconds(50),
             drainable: drainable);
 
@@ -558,16 +559,25 @@ internal class LeasedWorkerRunnerTests
 
         public Task SetStatusAsync(string workloadKey, WorkloadStatus status, string ownerInstanceId, TimeSpan ttl, CancellationToken ct)
         {
-            var record = new WorkloadStatusRecord
-            {
-                WorkloadKey = workloadKey,
-                Status = status,
-                OwnerInstanceId = ownerInstanceId,
-                ExpiresAtUtc = DateTimeOffset.UtcNow + ttl,
-            };
+            var now = DateTimeOffset.UtcNow;
 
             lock (this.records)
             {
+                // Write-once, same as the real store: preserved across writes while the record
+                // hasn't lapsed, reset if it had already expired away.
+                var createdAtUtc = this.records.TryGetValue(workloadKey, out var existing) && existing.ExpiresAtUtc > now
+                    ? existing.CreatedAtUtc
+                    : now;
+
+                var record = new WorkloadStatusRecord
+                {
+                    WorkloadKey = workloadKey,
+                    Status = status,
+                    OwnerInstanceId = ownerInstanceId,
+                    ExpiresAtUtc = now + ttl,
+                    CreatedAtUtc = createdAtUtc,
+                };
+
                 this.records[workloadKey] = record;
                 this.Writes.Add(record);
             }
@@ -583,6 +593,19 @@ internal class LeasedWorkerRunnerTests
                 IReadOnlyDictionary<string, WorkloadStatusRecord> result = workloadKeys
                     .Where(key => this.records.TryGetValue(key, out var record) && record.ExpiresAtUtc > now)
                     .ToDictionary(key => key, key => this.records[key], StringComparer.Ordinal);
+
+                return Task.FromResult(result);
+            }
+        }
+
+        public Task<IReadOnlyCollection<WorkloadStatusRecord>> GetAllAsync(CancellationToken ct)
+        {
+            lock (this.records)
+            {
+                var now = DateTimeOffset.UtcNow;
+                IReadOnlyCollection<WorkloadStatusRecord> result = this.records.Values
+                    .Where(record => record.ExpiresAtUtc > now)
+                    .ToArray();
 
                 return Task.FromResult(result);
             }

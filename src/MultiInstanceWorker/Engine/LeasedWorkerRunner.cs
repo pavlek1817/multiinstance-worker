@@ -70,6 +70,7 @@ internal sealed class LeasedWorkerRunner(
         {
             draining = true;
             drainStartedAtUtc = DateTimeOffset.UtcNow;
+
             // Call the drain function on actual workload
             drainable?.RequestDrain();
 

@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using MultiInstanceWorker;
 using MultiInstanceWorker.Sample.Api.Diagnostics;
@@ -7,13 +8,17 @@ using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Enums (WorkloadStatus, in /diagnostics) as strings rather than numbers - readable without the
+// caller having to know the enum's underlying values.
+builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+
 builder.Services
     .AddOptions<RedisOptions>()
     .Bind(builder.Configuration.GetSection(RedisOptions.SectionName));
 
 builder.Services
-    .AddOptions<WorkerTimingOptions>()
-    .Bind(builder.Configuration.GetSection(WorkerTimingOptions.SectionName))
+    .AddOptions<LeaderElectionConfig>()
+    .Bind(builder.Configuration.GetSection("WorkerTiming"))
     .Validate(
         options =>
         {
@@ -21,13 +26,6 @@ builder.Services
             return true;
         },
         "Invalid WorkerTiming configuration.");
-
-// RedisInstanceRegistry only needs the lease/heartbeat/drain timing, so it depends on the core
-// LeaderElectionConfig rather than the sample-specific WorkerTimingOptions - bound from the same
-// "WorkerTiming" section so both option types stay in sync.
-builder.Services
-    .AddOptions<LeaderElectionConfig>()
-    .Bind(builder.Configuration.GetSection(WorkerTimingOptions.SectionName));
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 {
@@ -43,12 +41,6 @@ builder.Services.AddSingleton<ILeaseManager, RedisLeaseManager>();
 builder.Services.AddSingleton<IInstanceRegistry, RedisInstanceRegistry>();
 builder.Services.AddSingleton<IWorkloadStatusStore, RedisWorkloadStatusStore>();
 
-builder.Services.AddSingleton<IJobExecutionStore>(sp => new RedisJobExecutionStore(
-    sp.GetRequiredService<IConnectionMultiplexer>(),
-    sp.GetRequiredService<IOptions<RedisOptions>>(),
-    TimeSpan.FromSeconds(sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value.JobStatsTtlSeconds)));
-builder.Services.AddSingleton<JobExecutionTracker>();
-
 // One SampleWorkerJob per catalog entry, reused for the app's lifetime: each is both the workload
 // (executeAsync) and the coordinator's cooperative drain target (drainable) for its job, so
 // RequestDrain and the ticking loop always share the same drain flag even as the coordinator
@@ -56,13 +48,12 @@ builder.Services.AddSingleton<JobExecutionTracker>();
 // AddWorkloadCoordinator delegate call below resolves the same cached dictionary.
 builder.Services.AddSingleton<IReadOnlyDictionary<string, SampleWorkerJob>>(sp =>
 {
-    var tracker = sp.GetRequiredService<JobExecutionTracker>();
     var identity = sp.GetRequiredService<IInstanceIdentityProvider>();
     var jobLogger = sp.GetRequiredService<ILogger<SampleWorkerJob>>();
 
     return JobCatalog.All.ToDictionary(
         job => job.WorkloadKey,
-        job => new SampleWorkerJob(job.Name, tracker, identity, jobLogger));
+        job => new SampleWorkerJob(job.Name, identity, jobLogger));
 });
 
 // Two coordinator hosted services - one per JobCatalog group - replace one LeasedWorkerHostedService
@@ -83,7 +74,7 @@ builder.Services.AddWorkloadCoordinator(
     keySelector: job => job.WorkloadKey,
     displayNameSelector: job => job.DisplayName,
     executeAsync: (sp, job, ct) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey].RunAsync(ct),
-    configFactory: sp => sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value,
+    configFactory: sp => sp.GetRequiredService<IOptions<LeaderElectionConfig>>().Value,
     drainableSelector: (sp, job) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey]);
 
 builder.Services.AddWorkloadCoordinator(
@@ -91,7 +82,7 @@ builder.Services.AddWorkloadCoordinator(
     keySelector: job => job.WorkloadKey,
     displayNameSelector: job => job.DisplayName,
     executeAsync: (sp, job, ct) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey].RunAsync(ct),
-    configFactory: sp => sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value,
+    configFactory: sp => sp.GetRequiredService<IOptions<LeaderElectionConfig>>().Value,
     drainableSelector: (sp, job) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey],
     workloadAssigner: new PrimaryNodeWorkloadAssigner());
 
@@ -99,13 +90,13 @@ var app = builder.Build();
 
 app.MapGet("/health", (IInstanceIdentityProvider identity) => Results.Ok(new { instanceId = identity.InstanceId }));
 
-app.MapGet("/diagnostics", async (IInstanceRegistry instanceRegistry, JobExecutionTracker tracker, CancellationToken ct) =>
+app.MapGet("/diagnostics", async (IInstanceRegistry instanceRegistry, IWorkloadStatusStore workloadStatusStore, CancellationToken ct) =>
 {
-    // Pulled straight from Redis, keyed by JobCatalog.All rather than "whatever this instance has
-    // touched" - so this shows the same fleet-wide picture (current owner, total ticks) whichever
-    // instance answers, not just the jobs this instance happens to be running.
-    var jobs = await tracker.SnapshotAllAsync(JobCatalog.All.Select(job => job.Name), ct);
-    return Results.Ok(new DiagnosticsResponse(instanceRegistry.InstanceId, instanceRegistry.IsDraining, jobs));
+    // Pulled straight from Redis via GetAllAsync (not filtered to JobCatalog.All) - the same
+    // fleet-wide picture (status, current owner) whichever instance answers, not just the
+    // workloads this instance happens to be running.
+    var workloads = await workloadStatusStore.GetAllAsync(ct);
+    return Results.Ok(new DiagnosticsResponse(instanceRegistry.InstanceId, instanceRegistry.IsDraining, workloads));
 });
 
 app.MapGet("/instances", async (IInstanceRegistry instanceRegistry, CancellationToken ct) =>

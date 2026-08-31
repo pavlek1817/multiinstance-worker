@@ -34,4 +34,12 @@ public interface IWorkloadStatusStore
     /// result rather than represented as an explicit <see cref="WorkloadStatus.Inactive"/> entry.
     /// </summary>
     Task<IReadOnlyDictionary<string, WorkloadStatusRecord>> GetStatusesAsync(IEnumerable<string> workloadKeys, CancellationToken ct);
+
+    /// <summary>
+    /// Reads every currently live workload status record this store knows about, fleet-wide -
+    /// e.g. for a diagnostics endpoint showing each workload's status and which instance is running
+    /// it. Unlike <see cref="GetStatusesAsync"/>, the caller doesn't need to already know the set of
+    /// workload keys to ask about.
+    /// </summary>
+    Task<IReadOnlyCollection<WorkloadStatusRecord>> GetAllAsync(CancellationToken ct);
 }

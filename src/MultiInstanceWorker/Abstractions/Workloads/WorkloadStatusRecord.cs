@@ -18,4 +18,12 @@ public sealed record WorkloadStatusRecord
     /// diagnostics.
     /// </summary>
     required public DateTimeOffset ExpiresAtUtc { get; init; }
+
+    /// <summary>
+    /// When this workload's status was first recorded - written once and never refreshed by
+    /// subsequent writes, the same write-once idea as <see cref="ActiveInstance.JoinedAtUtc"/>. A
+    /// gap where the record fully expires and later gets written again starts a new value here,
+    /// same as a restarted instance gets a new <c>JoinedAtUtc</c>.
+    /// </summary>
+    required public DateTimeOffset CreatedAtUtc { get; init; }
 }

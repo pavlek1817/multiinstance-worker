@@ -6,7 +6,7 @@ discovery, and even splitting of a set of named workloads across live instances.
 
 This library defines the coordination *logic* and the storage *contracts* it needs.
 It does not ship a Redis, SQL, or any other backing-store implementation — a
-consuming application supplies that by implementing two small interfaces.
+consuming application supplies that by implementing three small interfaces.
 
 ## Pieces
 
@@ -74,7 +74,10 @@ consuming application supplies that by implementing two small interfaces.
   `Transferring` off another instance — avoiding a runner that would just poll for a
   lease it can't get yet. This is a liveness/efficiency layer on top of `ILeaseManager`,
   not a substitute for it: the lease is still what actually prevents a double-run if a
-  status record is stale.
+  status record is stale. Each record also carries a write-once `CreatedAtUtc`, and
+  `GetAllAsync()` reads every currently live workload fleet-wide without the caller
+  needing to already know the keys — this is what the sample's `/diagnostics` endpoint
+  is built on, so a workload doesn't need to record anything of its own to show up there.
 - `IDrainableService` — an optional `RequestDrain()` contract a workload can implement
   to receive its own cooperative stop signal, instead of depending on `IInstanceRegistry`
   just to poll `IsDraining`. Pass the workload as `drainable` to `LeasedWorkerHostedService`
@@ -86,13 +89,6 @@ consuming application supplies that by implementing two small interfaces.
 - `LeaderElectionConfig` — timing knobs (lease TTL / renew interval, heartbeat TTL /
   interval, drain timeout) with validation that renewal intervals stay safely inside
   their TTLs.
-- `IJobExecutionStore` — another optional contract, alongside `IDrainableService`: lets a
-  workload record its own ticks (`RecordTickAsync`) and lets anything - a diagnostics
-  endpoint, say - read the fleet-wide execution state of every job (`GetAllAsync`),
-  regardless of which instance answers. Nothing in this package calls it; a workload's
-  own `executeAsync` resolves it from DI and calls it on its own terms, since this
-  package has no opinion on what a "tick" means for any given workload. The sample app's
-  `RedisJobExecutionStore` is a real implementation.
 - `AddLeasedWorker` / `AddWorkloadCoordinator<TWorkload>` — `IServiceCollection`
   extensions that register the two hosted services above without hand-writing their
   constructor wiring (see Usage sketch below). Both default
@@ -210,9 +206,10 @@ dotnet run --project samples/MultiInstanceWorker.Sample.Api --launch-profile Ins
 Both profiles default to `localhost:6379`; point `Redis:ConnectionString` at whatever Redis you
 have running (`docker run --rm -p 6379:6379 redis:7.4` works). Each instance exposes:
 
-- `GET /diagnostics` — this instance's id and drain state, plus each job's owner instance id,
-  total tick count, and last tick time - read straight from Redis, so it's the same fleet-wide
-  view whichever instance you ask.
+- `GET /diagnostics` — this instance's id and drain state, plus every workload's status
+  (`Active`/`Transferring`/`Inactive`), current owner, and `CreatedAtUtc` - read straight from
+  `IWorkloadStatusStore` via `GetAllAsync()`, so it's the same fleet-wide view whichever instance
+  you ask.
 - `GET /instances` — the active (non-draining) instance ids this instance currently sees.
 - `POST /drain` — manually triggers this instance's drain, without stopping its host, to see the
   other instance take over both jobs.

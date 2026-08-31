@@ -482,14 +482,23 @@ internal class WorkloadCoordinatorHostedServiceTests
 
         public Task SetStatusAsync(string workloadKey, WorkloadStatus status, string ownerInstanceId, TimeSpan ttl, CancellationToken ct)
         {
+            var now = DateTimeOffset.UtcNow;
+
             lock (this.records)
             {
+                // Write-once, same as the real store: preserved across writes while the record
+                // hasn't lapsed, reset if it had already expired away.
+                var createdAtUtc = this.records.TryGetValue(workloadKey, out var existing) && existing.ExpiresAtUtc > now
+                    ? existing.CreatedAtUtc
+                    : now;
+
                 this.records[workloadKey] = new WorkloadStatusRecord
                 {
                     WorkloadKey = workloadKey,
                     Status = status,
                     OwnerInstanceId = ownerInstanceId,
-                    ExpiresAtUtc = DateTimeOffset.UtcNow + ttl,
+                    ExpiresAtUtc = now + ttl,
+                    CreatedAtUtc = createdAtUtc,
                 };
             }
 
@@ -504,6 +513,19 @@ internal class WorkloadCoordinatorHostedServiceTests
                 IReadOnlyDictionary<string, WorkloadStatusRecord> result = workloadKeys
                     .Where(key => this.records.TryGetValue(key, out var record) && record.ExpiresAtUtc > now)
                     .ToDictionary(key => key, key => this.records[key], StringComparer.Ordinal);
+
+                return Task.FromResult(result);
+            }
+        }
+
+        public Task<IReadOnlyCollection<WorkloadStatusRecord>> GetAllAsync(CancellationToken ct)
+        {
+            lock (this.records)
+            {
+                var now = DateTimeOffset.UtcNow;
+                IReadOnlyCollection<WorkloadStatusRecord> result = this.records.Values
+                    .Where(record => record.ExpiresAtUtc > now)
+                    .ToArray();
 
                 return Task.FromResult(result);
             }
