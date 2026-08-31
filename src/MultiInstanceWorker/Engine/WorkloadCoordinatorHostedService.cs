@@ -26,6 +26,13 @@ namespace MultiInstanceWorker;
 /// <param name="instanceRegistry">Tracks this instance's heartbeat, drain state, and the active-instance set the assigner divides workloads across.</param>
 /// <param name="instanceIdentityProvider">This process's unique instance id, used to prove lease/heartbeat ownership.</param>
 /// <param name="leaseManager">Grants each assigned workload's lease to exactly one instance at a time.</param>
+/// <param name="workloadStatusStore">
+/// Tracks each workload's <see cref="WorkloadStatus"/> across the fleet. Written by each local
+/// <see cref="LeasedWorkerRunner"/> as it moves through its lifecycle, and read here before starting
+/// a newly assigned workload: one still <see cref="WorkloadStatus.Transferring"/> off another
+/// instance is left for a later tick instead of starting a runner that would just poll for a lease
+/// it cannot get yet. The lease itself, not this, remains the actual safety mechanism.
+/// </param>
 /// <param name="workloadAssigner">
 /// Decides which of <paramref name="workloads"/> belong to this instance on each tick (e.g.
 /// <see cref="BalancedNamedWorkloadAssigner"/> or <see cref="PrimaryNodeWorkloadAssigner"/>). This
@@ -53,6 +60,7 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
     IInstanceRegistry instanceRegistry,
     IInstanceIdentityProvider instanceIdentityProvider,
     ILeaseManager leaseManager,
+    IWorkloadStatusStore workloadStatusStore,
     IWorkloadAssigner workloadAssigner,
     IReadOnlyCollection<TWorkload> workloads,
     Func<TWorkload, string> keySelector,
@@ -96,10 +104,13 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
         }
         finally
         {
+            // Marking the instance draining in the backing store is never this coordinator's call to
+            // make - that is a deliberate, external act (e.g. a /drain endpoint or a preStop hook),
+            // not something inferred from stoppingToken cancelling. isDraining here only decides
+            // whether to wait for runners to finish gracefully or force-stop them.
             var isDraining = stoppingToken.IsCancellationRequested || instanceRegistry.IsDraining;
             if (isDraining)
             {
-                await instanceRegistry.BeginDrainAsync(CancellationToken.None);
                 await this.waitForAllAsync();
             }
             else
@@ -127,6 +138,13 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
     /// so risk the rest of the fleet seeing a perfectly healthy instance as dead) for as long as the
     /// removed workload takes to wind down. A runner that already finished is cleaned up
     /// immediately; one still running is left alone and picked up on a later tick.
+    /// <para/>
+    /// Starting is additionally gated on <see cref="WorkloadStatus"/>: a newly assigned workload
+    /// whose last-known status is still <see cref="WorkloadStatus.Transferring"/> off some other
+    /// instance is left unstarted this tick rather than spun up as a runner doomed to poll for a
+    /// lease it cannot get yet. This is a cheap, observable short-circuit on top of the lease, not a
+    /// substitute for it — the lease is still what actually prevents a double-run if the status
+    /// store is stale.
     /// </remarks>
     private async Task reconcileRunnersAsync(
         IReadOnlyCollection<TWorkload> assignedWorkloads,
@@ -134,11 +152,11 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
     {
         var assignedByKey = assignedWorkloads.ToDictionary(keySelector);
 
-        var removedKeys = this.activeRunners.Keys
+        var workloadToRemoveKeys = this.activeRunners.Keys
             .Where(key => !assignedByKey.ContainsKey(key))
             .ToArray();
 
-        foreach (var removedKey in removedKeys)
+        foreach (var removedKey in workloadToRemoveKeys)
         {
             if (!this.activeRunners.TryGetValue(removedKey, out var state))
             {
@@ -160,6 +178,16 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
             }
         }
 
+        var keysNeedingStart = assignedByKey.Keys
+            .Where(key => !this.activeRunners.ContainsKey(key))
+            .ToArray();
+
+        // Batched once per tick, not per workload - GetStatusesAsync already reads its keys in
+        // parallel, and there's no need for a round trip per newly assigned workload.
+        var statuses = keysNeedingStart.Length == 0
+            ? new Dictionary<string, WorkloadStatusRecord>()
+            : await workloadStatusStore.GetStatusesAsync(keysNeedingStart, stoppingToken);
+
         foreach (var workload in assignedByKey.Values)
         {
             var key = keySelector(workload);
@@ -168,19 +196,30 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
                 continue;
             }
 
+            if (statuses.TryGetValue(key, out var status)
+                && status.Status == WorkloadStatus.Transferring
+                && !string.Equals(status.OwnerInstanceId, instanceRegistry.InstanceId, StringComparison.Ordinal))
+            {
+                // Still finishing up on another instance - starting a runner here now would just
+                // poll for a lease it can't get yet. Leave it for a later tick; the lease itself
+                // (not this check) is what actually prevents a double-run if this status is stale.
+                WorkloadCoordinatorLog.WorkloadTransferPending(logger, key, status.OwnerInstanceId);
+                continue;
+            }
+
             WorkloadCoordinatorLog.WorkloadAssigned(logger, key);
 
-            // Use an independent CTS — NOT linked to the host stoppingToken.
-            // This lets the coordinator cancel only this runner (e.g. workload reassignment)
-            // without triggering instance-level drain logic inside the runner.
-            // The host stoppingToken is passed separately as shutdownToken so the runner can
-            // distinguish "I was reassigned" from "the whole instance is shutting down."
-            var runnerTokenSource = new CancellationTokenSource();
+            // Linked to the host's stoppingToken: cancelling either fires the one token the runner
+            // watches, and the runner treats both causes identically (see LeasedWorkerRunner's own
+            // remarks) - reassignment cancels just this runner's own source directly (below, in the
+            // removal loop), a real host shutdown cancels every linked source at once via the parent.
+            var runnerTokenSource = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
             var runner = new LeasedWorkerRunner(
                 loggerFactory.CreateLogger<WorkloadCoordinatorHostedService<TWorkload>>(),
                 leaseManager,
                 instanceIdentityProvider,
                 instanceRegistry,
+                workloadStatusStore,
                 workloadKey: key,
                 displayName: displayNameSelector(workload),
                 leaseTtl: leaseTtl,
@@ -189,12 +228,10 @@ public sealed class WorkloadCoordinatorHostedService<TWorkload>(
                 executeAsync: ct => executeAsync(workload, ct),
                 drainable: drainableSelector?.Invoke(workload));
 
-            // Pass the per-runner token as stoppingToken (cancelled on reassignment)
-            // and the host stoppingToken as shutdownToken (cancelled on instance shutdown).
             this.activeRunners[key] = new RunnerState(
                 workload,
                 runnerTokenSource,
-                Task.Run(() => runner.RunAsync(runnerTokenSource.Token, shutdownToken: stoppingToken), CancellationToken.None));
+                Task.Run(() => runner.RunAsync(runnerTokenSource.Token), CancellationToken.None));
         }
     }
 

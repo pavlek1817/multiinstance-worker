@@ -15,10 +15,10 @@ namespace MultiInstanceWorker;
 /// (<see cref="IInstanceIdentityProvider"/> via <see cref="ProcessInstanceIdentityProvider"/>, and
 /// for <see cref="AddWorkloadCoordinator{TWorkload}"/>, <see cref="IWorkloadAssigner"/> via
 /// <see cref="BalancedNamedWorkloadAssigner"/>) using <c>TryAdd</c>, so a consumer's own
-/// registration - made before or after calling these - always wins. <see cref="ILeaseManager"/> and
-/// <see cref="IInstanceRegistry"/> are never defaulted: this package is provider-agnostic and has
-/// no backing-store implementation to offer, so a consumer must register those against its own
-/// store before calling either extension.
+/// registration - made before or after calling these - always wins. <see cref="ILeaseManager"/>,
+/// <see cref="IInstanceRegistry"/>, and <see cref="IWorkloadStatusStore"/> are never defaulted: this
+/// package is provider-agnostic and has no backing-store implementation to offer, so a consumer must
+/// register those against its own store before calling either extension.
 /// </remarks>
 public static class MultiInstanceWorkerServiceCollectionExtensions
 {
@@ -74,6 +74,7 @@ public static class MultiInstanceWorkerServiceCollectionExtensions
                 sp.GetRequiredService<ILeaseManager>(),
                 sp.GetRequiredService<IInstanceIdentityProvider>(),
                 sp.GetRequiredService<IInstanceRegistry>(),
+                sp.GetRequiredService<IWorkloadStatusStore>(),
                 workloadKey: workloadKey,
                 displayName: displayName,
                 leaseTtl: TimeSpan.FromMilliseconds(config.LeaseTtlMs),
@@ -150,6 +151,7 @@ public static class MultiInstanceWorkerServiceCollectionExtensions
                 sp.GetRequiredService<IInstanceRegistry>(),
                 sp.GetRequiredService<IInstanceIdentityProvider>(),
                 sp.GetRequiredService<ILeaseManager>(),
+                sp.GetRequiredService<IWorkloadStatusStore>(),
                 workloadAssigner ?? sp.GetRequiredService<IWorkloadAssigner>(),
                 workloads,
                 keySelector: keySelector,

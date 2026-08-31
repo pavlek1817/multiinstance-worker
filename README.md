@@ -22,13 +22,19 @@ consuming application supplies that by implementing two small interfaces.
   read-then-write of the lease record).
 - `LeasedWorkerRunner` / `LeasedWorkerHostedService` — drives a workload's lifecycle:
   acquire-or-renew the lease every `renewInterval`, start the workload when owned,
-  stop it when the lease is lost, and release the lease on shutdown. On shutdown (or
-  whenever `IInstanceRegistry.IsDraining` becomes true for any other reason, e.g. an
-  operator-triggered drain ahead of downsizing) it stops taking new work but lets an
-  in-flight worker finish on its own — up to a `drainTimeout` ceiling — instead of
-  cancelling it immediately, so in-flight work hands over cleanly rather than getting
-  dropped. `LeasedWorkerRunner` is the internal state machine; `LeasedWorkerHostedService`
-  (the public entry point) adapts it to the hosted-service lifecycle.
+  stop it when the lease is lost, and release the lease when told to stop. When its
+  `stoppingToken` is cancelled (a coordinator reassigned this workload elsewhere, or
+  the whole host is shutting down — the runner treats both identically) or
+  `IInstanceRegistry.IsDraining` is already true (an operator drained the instance
+  externally), it stops taking new work but lets an in-flight worker finish on its
+  own — up to a `drainTimeout` ceiling — instead of cancelling it immediately, so
+  in-flight work hands over cleanly rather than getting dropped. It never calls
+  `IInstanceRegistry.BeginDrainAsync` itself: marking the whole instance draining in
+  the backing store is a deliberate, external act (e.g. a `/drain` endpoint or a
+  preStop hook), never inferred from a token cancelling — see
+  [Draining an instance](#draining-an-instance) below. `LeasedWorkerRunner` is the
+  internal state machine; `LeasedWorkerHostedService` (the public entry point) adapts
+  it to the hosted-service lifecycle.
 - `IWorkloadAssigner` — decides which of a set of named workloads belong to *this*
   instance, given the active instances, so a coordinator knows what to attempt
   locally. It's a liveness/efficiency decision, not the safety one — `ILeaseManager`
@@ -51,12 +57,24 @@ consuming application supplies that by implementing two small interfaces.
   workloads and stopping ones that dropped out of the assignment. A workload that
   drops out of the assignment — whether because this instance is draining or because
   a plain rebalance moved it elsewhere — gets the same `drainTimeout`-bounded "let it
-  finish" treatment as a full shutdown; a rebalance just never marks the *instance*
-  itself as draining the way a real shutdown does. The coordinator's own tick loop
-  never blocks waiting on this: a still-finishing runner is left alone and cleaned up
-  on a later tick, so this instance's own heartbeat keeps going the whole time.
+  finish" treatment either way; neither ever marks the *instance* itself as draining
+  in the backing store — that stays an explicit, external act regardless of cause.
+  The coordinator's own tick loop never blocks waiting on this: a still-finishing
+  runner is left alone and cleaned up on a later tick, so this instance's own
+  heartbeat keeps going the whole time.
   Workload construction and execution stay entirely in the `executeAsync` delegate
   you supply — this class knows nothing about what a workload actually does.
+- `IWorkloadStatusStore` — tracks each workload's lifecycle state (`WorkloadStatus`:
+  `Active` / `Transferring` / `Inactive`) across the fleet. `LeasedWorkerRunner` writes
+  `Active` (refreshed every `renewInterval` — the workload's own heartbeat) while it
+  owns the lease and runs, `Transferring` for the whole drain wind-down (TTL-bounded by
+  `drainTimeout`, so a crashed instance can never block a handover longer than it could
+  ever legitimately keep finishing work), and `Inactive` once it releases. A coordinator
+  reads it before starting a newly assigned workload and defers starting one still
+  `Transferring` off another instance — avoiding a runner that would just poll for a
+  lease it can't get yet. This is a liveness/efficiency layer on top of `ILeaseManager`,
+  not a substitute for it: the lease is still what actually prevents a double-run if a
+  status record is stale.
 - `IDrainableService` — an optional `RequestDrain()` contract a workload can implement
   to receive its own cooperative stop signal, instead of depending on `IInstanceRegistry`
   just to poll `IsDraining`. Pass the workload as `drainable` to `LeasedWorkerHostedService`
@@ -81,14 +99,42 @@ consuming application supplies that by implementing two small interfaces.
   `IInstanceIdentityProvider` to `ProcessInstanceIdentityProvider` (and
   `AddWorkloadCoordinator` defaults `IWorkloadAssigner` to `BalancedNamedWorkloadAssigner`)
   via `TryAdd`, so a consumer's own registration always wins if they need something else.
-  `ILeaseManager` and `IInstanceRegistry` are never defaulted — register those against
-  your own store before calling either extension.
+  `ILeaseManager`, `IInstanceRegistry`, and `IWorkloadStatusStore` are never defaulted —
+  register those against your own store before calling either extension.
+
+## Draining an instance
+
+Marking a whole instance draining (`IInstanceRegistry.BeginDrainAsync`) is always a deliberate,
+external act — nothing in this library calls it on your behalf, no matter why a workload's runner
+stops. A consumer wires it up as its own endpoint or lifecycle hook, e.g.:
+
+```csharp
+app.MapPost("/drain", async (IInstanceRegistry instanceRegistry, CancellationToken ct) =>
+{
+    await instanceRegistry.BeginDrainAsync(ct);
+    return Results.Accepted();
+});
+```
+
+...called from wherever your orchestrator can reach before it tears the instance down — a
+Kubernetes `preStop` hook hitting that endpoint is the common case. Once called, `GetActiveInstancesAsync`
+excludes the instance fleet-wide, so no new workload gets assigned to it, while every workload
+already running there keeps finishing on its own (up to `drainTimeout`) via the exact same
+graceful wind-down a plain per-workload reassignment goes through.
+
+A bare shutdown (SIGTERM, `stoppingToken` cancelled) with no prior `/drain` call still winds every
+workload down gracefully — `LeasedWorkerRunner` doesn't need `BeginDrainAsync` to have been called
+to do that — it just won't proactively exclude the instance from new assignments; that only happens
+once its heartbeat naturally expires. If you want the fleet to stop routing new work to an instance
+the moment it starts shutting down, call the drain endpoint (or `BeginDrainAsync` directly) as the
+first step of your shutdown sequence, before the host actually stops.
 
 ## Usage sketch
 
 ```csharp
-services.AddSingleton<ILeaseManager, YourLeaseManager>();       // your store adapter
-services.AddSingleton<IInstanceRegistry, YourInstanceRegistry>(); // your store adapter
+services.AddSingleton<ILeaseManager, YourLeaseManager>();             // your store adapter
+services.AddSingleton<IInstanceRegistry, YourInstanceRegistry>();     // your store adapter
+services.AddSingleton<IWorkloadStatusStore, YourWorkloadStatusStore>(); // your store adapter
 
 services.AddLeasedWorker(
     workloadKey: "singleton:some-background-job",
@@ -131,7 +177,7 @@ finer control than the extensions give you.
 ```
 src/MultiInstanceWorker/                the library
 samples/MultiInstanceWorker.Sample.Api/ a runnable ASP.NET Core sample, Redis-backed (see below)
-test/MultiInstanceWorker.Tests/         unit tests (mocked ILeaseManager/IInstanceRegistry)
+test/MultiInstanceWorker.Tests/         unit tests (mocked ILeaseManager/IInstanceRegistry/IWorkloadStatusStore)
 test/MultiInstanceWorker.FunctionalTests/ functional tests against a real Redis (see below)
 docs/leader-election-flow.md            lifecycle diagram and write-up
 ```
@@ -139,8 +185,8 @@ docs/leader-election-flow.md            lifecycle diagram and write-up
 ## Sample app: two instances, six jobs, real Redis
 
 `samples/MultiInstanceWorker.Sample.Api` is a minimal-API app that wires this library up to a
-**Redis-backed `ILeaseManager`/`IInstanceRegistry`** (`samples/.../Redis/RedisLeaseManager.cs`,
-`RedisInstanceRegistry.cs`) and runs six named jobs (`JobCatalog`) as sharded workloads under two
+**Redis-backed `ILeaseManager`/`IInstanceRegistry`/`IWorkloadStatusStore`** (`samples/.../Redis/RedisLeaseManager.cs`,
+`RedisInstanceRegistry.cs`, `RedisWorkloadStatusStore.cs`) and runs six named jobs (`JobCatalog`) as sharded workloads under two
 `WorkloadCoordinatorHostedService<TWorkload>`s, each with its own `IWorkloadAssigner` strategy,
 instead of leaving each job to race for its own lease:
 
@@ -207,11 +253,13 @@ here. Wiring that service up to this package means:
 
 1. Reference this package from the consumer (local `ProjectReference` during
    development, or a `PackageReference` once this is published to a feed).
-2. Write thin adapters implementing `ILeaseManager` and `IInstanceRegistry` against
-   whatever store the consumer already uses (its existing Redis-backed
-   `RedisLeaseManager` / `RedisInstanceRegistry` are a near-literal starting point —
-   the abstraction shapes are unchanged from what those already do, including the
-   `IsDraining` / `BeginDrainAsync` members added for the draining/downsizing case).
+2. Write thin adapters implementing `ILeaseManager`, `IInstanceRegistry`, and
+   `IWorkloadStatusStore` against whatever store the consumer already uses (its
+   existing Redis-backed `RedisLeaseManager` / `RedisInstanceRegistry` are a
+   near-literal starting point for the first two — the abstraction shapes are
+   unchanged from what those already do, including the `IsDraining` /
+   `BeginDrainAsync` members added for the draining/downsizing case; see this
+   package's own `RedisWorkloadStatusStore` sample for the third).
 3. Delete the consumer's local copies of `IInstanceIdentityProvider`,
    `ProcessInstanceIdentityProvider`, `IRedisLeaseManager` → `ILeaseManager`,
    `LeasedWorkerRunner`, `LeasedWorkerHostedService`, `BalancedNamedWorkloadAssigner`,

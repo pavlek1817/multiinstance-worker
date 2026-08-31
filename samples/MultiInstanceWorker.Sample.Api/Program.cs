@@ -35,12 +35,13 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
     return ConnectionMultiplexer.Connect(redisOptions.ConnectionString);
 });
 
-// The core package is provider-agnostic - it does not know about Redis. These two adapters are
+// The core package is provider-agnostic - it does not know about Redis. These three adapters are
 // what a consuming application supplies itself, per the README. (IInstanceIdentityProvider isn't
 // listed here: AddWorkloadCoordinator below defaults it to the stock ProcessInstanceIdentityProvider
 // via TryAdd, and nothing in this sample needs a custom one.)
 builder.Services.AddSingleton<ILeaseManager, RedisLeaseManager>();
 builder.Services.AddSingleton<IInstanceRegistry, RedisInstanceRegistry>();
+builder.Services.AddSingleton<IWorkloadStatusStore, RedisWorkloadStatusStore>();
 
 builder.Services.AddSingleton<IJobExecutionStore>(sp => new RedisJobExecutionStore(
     sp.GetRequiredService<IConnectionMultiplexer>(),
@@ -113,8 +114,15 @@ app.MapGet("/instances", async (IInstanceRegistry instanceRegistry, Cancellation
     return Results.Ok(activeInstances.Select(x => x.InstanceId));
 });
 
-// Lets a test (or an operator) trigger this instance's drain without tearing down the whole
-// host, demonstrating the "operator-triggered drain ahead of downsizing" case from the README.
+// Lets a test (or an operator - e.g. a Kubernetes preStop hook, called just before SIGTERM) trigger
+// this instance's drain without tearing down the whole host, demonstrating the "operator-triggered
+// drain ahead of downsizing" case from the README. This is the ONLY place in this sample that calls
+// BeginDrainAsync: neither LeasedWorkerRunner nor WorkloadCoordinatorHostedService ever call it
+// themselves - marking the whole instance draining fleet-wide is a deliberate, external act, not
+// something the library infers from a cancellation token. A bare SIGTERM without a preceding call
+// here still winds every workload down gracefully (same drainTimeout-bounded treatment), it just
+// won't proactively exclude this instance from new assignments - that only happens once its
+// heartbeat naturally expires.
 app.MapPost("/drain", async (IInstanceRegistry instanceRegistry, CancellationToken ct) =>
 {
     await instanceRegistry.BeginDrainAsync(ct);
