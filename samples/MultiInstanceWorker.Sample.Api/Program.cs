@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using MultiInstanceWorker;
 using MultiInstanceWorker.Sample.Api.Diagnostics;
@@ -7,13 +8,17 @@ using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Enums (WorkloadStatus, in /diagnostics) as strings rather than numbers - readable without the
+// caller having to know the enum's underlying values.
+builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+
 builder.Services
     .AddOptions<RedisOptions>()
     .Bind(builder.Configuration.GetSection(RedisOptions.SectionName));
 
 builder.Services
-    .AddOptions<WorkerTimingOptions>()
-    .Bind(builder.Configuration.GetSection(WorkerTimingOptions.SectionName))
+    .AddOptions<LeaderElectionConfig>()
+    .Bind(builder.Configuration.GetSection("WorkerTiming"))
     .Validate(
         options =>
         {
@@ -22,31 +27,19 @@ builder.Services
         },
         "Invalid WorkerTiming configuration.");
 
-// RedisInstanceRegistry only needs the lease/heartbeat/drain timing, so it depends on the core
-// LeaderElectionConfig rather than the sample-specific WorkerTimingOptions - bound from the same
-// "WorkerTiming" section so both option types stay in sync.
-builder.Services
-    .AddOptions<LeaderElectionConfig>()
-    .Bind(builder.Configuration.GetSection(WorkerTimingOptions.SectionName));
-
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 {
     var redisOptions = sp.GetRequiredService<IOptions<RedisOptions>>().Value;
     return ConnectionMultiplexer.Connect(redisOptions.ConnectionString);
 });
 
-// The core package is provider-agnostic - it does not know about Redis. These two adapters are
+// The core package is provider-agnostic - it does not know about Redis. These three adapters are
 // what a consuming application supplies itself, per the README. (IInstanceIdentityProvider isn't
 // listed here: AddWorkloadCoordinator below defaults it to the stock ProcessInstanceIdentityProvider
 // via TryAdd, and nothing in this sample needs a custom one.)
 builder.Services.AddSingleton<ILeaseManager, RedisLeaseManager>();
 builder.Services.AddSingleton<IInstanceRegistry, RedisInstanceRegistry>();
-
-builder.Services.AddSingleton<IJobExecutionStore>(sp => new RedisJobExecutionStore(
-    sp.GetRequiredService<IConnectionMultiplexer>(),
-    sp.GetRequiredService<IOptions<RedisOptions>>(),
-    TimeSpan.FromSeconds(sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value.JobStatsTtlSeconds)));
-builder.Services.AddSingleton<JobExecutionTracker>();
+builder.Services.AddSingleton<IWorkloadStatusStore, RedisWorkloadStatusStore>();
 
 // One SampleWorkerJob per catalog entry, reused for the app's lifetime: each is both the workload
 // (executeAsync) and the coordinator's cooperative drain target (drainable) for its job, so
@@ -55,41 +48,55 @@ builder.Services.AddSingleton<JobExecutionTracker>();
 // AddWorkloadCoordinator delegate call below resolves the same cached dictionary.
 builder.Services.AddSingleton<IReadOnlyDictionary<string, SampleWorkerJob>>(sp =>
 {
-    var tracker = sp.GetRequiredService<JobExecutionTracker>();
     var identity = sp.GetRequiredService<IInstanceIdentityProvider>();
     var jobLogger = sp.GetRequiredService<ILogger<SampleWorkerJob>>();
 
     return JobCatalog.All.ToDictionary(
         job => job.WorkloadKey,
-        job => new SampleWorkerJob(job.Name, tracker, identity, jobLogger));
+        job => new SampleWorkerJob(job.Name, identity, jobLogger));
 });
 
-// A single coordinator hosted service replaces one LeasedWorkerHostedService per job: instead of
-// each job racing independently for its own lease (whichever instance gets there first keeps it
-// forever, so nothing stops one instance from ending up with every job), the coordinator
-// heartbeats, asks its IWorkloadAssigner for this instance's slice of JobCatalog.All on every
-// tick, and reconciles local LeasedWorkerRunners to match. It also subsumes what the sample's old
-// standalone HeartbeatHostedService did (heartbeat + remove-on-shutdown), so that service is no
-// longer registered.
+// Two coordinator hosted services - one per JobCatalog group - replace one LeasedWorkerHostedService
+// per job: instead of each job racing independently for its own lease (whichever instance gets
+// there first keeps it forever, so nothing stops one instance from ending up with every job), each
+// coordinator heartbeats, asks its own IWorkloadAssigner for this instance's slice of its group on
+// every tick, and reconciles local LeasedWorkerRunners to match. Both also subsume what the
+// sample's old standalone HeartbeatHostedService did (heartbeat + remove-on-shutdown), so that
+// service is no longer registered.
+//
+// JobCatalog.Balanced uses the default IWorkloadAssigner (BalancedNamedWorkloadAssigner - spread
+// evenly across live instances); JobCatalog.Primary passes PrimaryNodeWorkloadAssigner explicitly
+// to run active/passive instead, all on whichever instance joined earliest. Registering
+// AddWorkloadCoordinator twice is safe - each call appends its own IHostedService rather than
+// replacing the other, and the two groups' WorkloadKeys never collide.
 builder.Services.AddWorkloadCoordinator(
-    JobCatalog.All,
+    JobCatalog.Balanced,
     keySelector: job => job.WorkloadKey,
     displayNameSelector: job => job.DisplayName,
     executeAsync: (sp, job, ct) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey].RunAsync(ct),
-    configFactory: sp => sp.GetRequiredService<IOptions<WorkerTimingOptions>>().Value,
+    configFactory: sp => sp.GetRequiredService<IOptions<LeaderElectionConfig>>().Value,
     drainableSelector: (sp, job) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey]);
+
+builder.Services.AddWorkloadCoordinator(
+    JobCatalog.Primary,
+    keySelector: job => job.WorkloadKey,
+    displayNameSelector: job => job.DisplayName,
+    executeAsync: (sp, job, ct) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey].RunAsync(ct),
+    configFactory: sp => sp.GetRequiredService<IOptions<LeaderElectionConfig>>().Value,
+    drainableSelector: (sp, job) => sp.GetRequiredService<IReadOnlyDictionary<string, SampleWorkerJob>>()[job.WorkloadKey],
+    workloadAssigner: new PrimaryNodeWorkloadAssigner());
 
 var app = builder.Build();
 
 app.MapGet("/health", (IInstanceIdentityProvider identity) => Results.Ok(new { instanceId = identity.InstanceId }));
 
-app.MapGet("/diagnostics", async (IInstanceRegistry instanceRegistry, JobExecutionTracker tracker, CancellationToken ct) =>
+app.MapGet("/diagnostics", async (IInstanceRegistry instanceRegistry, IWorkloadStatusStore workloadStatusStore, CancellationToken ct) =>
 {
-    // Pulled straight from Redis, keyed by JobCatalog.All rather than "whatever this instance has
-    // touched" - so this shows the same fleet-wide picture (current owner, total ticks) whichever
-    // instance answers, not just the jobs this instance happens to be running.
-    var jobs = await tracker.SnapshotAllAsync(JobCatalog.All.Select(job => job.Name), ct);
-    return Results.Ok(new DiagnosticsResponse(instanceRegistry.InstanceId, instanceRegistry.IsDraining, jobs));
+    // Pulled straight from Redis via GetAllAsync (not filtered to JobCatalog.All) - the same
+    // fleet-wide picture (status, current owner) whichever instance answers, not just the
+    // workloads this instance happens to be running.
+    var workloads = await workloadStatusStore.GetAllAsync(ct);
+    return Results.Ok(new DiagnosticsResponse(instanceRegistry.InstanceId, instanceRegistry.IsDraining, workloads));
 });
 
 app.MapGet("/instances", async (IInstanceRegistry instanceRegistry, CancellationToken ct) =>
@@ -98,8 +105,15 @@ app.MapGet("/instances", async (IInstanceRegistry instanceRegistry, Cancellation
     return Results.Ok(activeInstances.Select(x => x.InstanceId));
 });
 
-// Lets a test (or an operator) trigger this instance's drain without tearing down the whole
-// host, demonstrating the "operator-triggered drain ahead of downsizing" case from the README.
+// Lets a test (or an operator - e.g. a Kubernetes preStop hook, called just before SIGTERM) trigger
+// this instance's drain without tearing down the whole host, demonstrating the "operator-triggered
+// drain ahead of downsizing" case from the README. This is the ONLY place in this sample that calls
+// BeginDrainAsync: neither LeasedWorkerRunner nor WorkloadCoordinatorHostedService ever call it
+// themselves - marking the whole instance draining fleet-wide is a deliberate, external act, not
+// something the library infers from a cancellation token. A bare SIGTERM without a preceding call
+// here still winds every workload down gracefully (same drainTimeout-bounded treatment), it just
+// won't proactively exclude this instance from new assignments - that only happens once its
+// heartbeat naturally expires.
 app.MapPost("/drain", async (IInstanceRegistry instanceRegistry, CancellationToken ct) =>
 {
     await instanceRegistry.BeginDrainAsync(ct);

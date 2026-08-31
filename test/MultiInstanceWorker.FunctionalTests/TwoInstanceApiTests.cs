@@ -5,20 +5,22 @@ using FluentAssertions;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
+using MultiInstanceWorker.Sample.Api.Jobs;
 
 namespace MultiInstanceWorker.FunctionalTests;
 
 /// <summary>
-/// Runs two real instances of the sample API - each hosting the same two worker jobs - against
-/// one shared Redis, and proves the thing this whole exercise is about: the Redis lease keeps
-/// exactly one instance running each job at a time, and the other instance takes over once the
-/// owner stops.
+/// Runs two real instances of the sample API - each hosting the same worker jobs - against one
+/// shared Redis, and proves the thing this whole exercise is about: the Redis lease keeps exactly
+/// one instance running each job at a time, and the other instance takes over once the owner
+/// stops. Only exercises the two <c>JobCatalog.Balanced</c> jobs - <c>JobCatalog.Primary</c>'s
+/// active/passive behavior is a separate concern from what this suite is proving here.
 /// </summary>
 internal sealed class TwoInstanceApiTests
 {
     private static readonly TimeSpan PollTimeout = TimeSpan.FromSeconds(15);
 
-    private static readonly string[] JobNames = { "order-cleanup", "inventory-sync" };
+    private static readonly string[] WorkloadKeys = { JobCatalog.OrderCleanup.WorkloadKey, JobCatalog.InventorySync.WorkloadKey };
 
     private static readonly JsonSerializerOptions JsonOptions = new (JsonSerializerDefaults.Web);
 
@@ -49,9 +51,9 @@ internal sealed class TwoInstanceApiTests
     [Test]
     public async Task BothJobs_EventuallyGetExactlyOneOwnerAcrossTheTwoInstances()
     {
-        foreach (var jobName in JobNames)
+        foreach (var workloadKey in WorkloadKeys)
         {
-            await this.waitUntilAsync(async () => await this.countOwnersAsync(jobName) == 1);
+            await this.waitUntilAsync(async () => await this.countOwnersAsync(workloadKey) == 1);
         }
     }
 
@@ -63,10 +65,10 @@ internal sealed class TwoInstanceApiTests
         var deadline = DateTimeOffset.UtcNow.Add(PollTimeout);
         while (DateTimeOffset.UtcNow < deadline)
         {
-            foreach (var jobName in JobNames)
+            foreach (var workloadKey in WorkloadKeys)
             {
-                var owners = await this.countOwnersAsync(jobName);
-                owners.Should().BeLessThanOrEqualTo(1, $"the Redis lease for '{jobName}' must never be held by both instances at once");
+                var owners = await this.countOwnersAsync(workloadKey);
+                owners.Should().BeLessThanOrEqualTo(1, $"the Redis lease for '{workloadKey}' must never be held by both instances at once");
             }
 
             await Task.Delay(50);
@@ -78,12 +80,12 @@ internal sealed class TwoInstanceApiTests
     {
         // Let ownership settle first: every job must have converged to exactly one owner before
         // draining one of the instances.
-        foreach (var jobName in JobNames)
+        foreach (var workloadKey in WorkloadKeys)
         {
-            await this.waitUntilAsync(async () => await this.countOwnersAsync(jobName) == 1);
+            await this.waitUntilAsync(async () => await this.countOwnersAsync(workloadKey) == 1);
         }
 
-        var aOwnsOrderCleanup = await isOwnerAsync(this.clientA, "order-cleanup");
+        var aOwnsOrderCleanup = await isOwnerAsync(this.clientA, JobCatalog.OrderCleanup.WorkloadKey);
         var (drainingClient, survivingClient) = aOwnsOrderCleanup ? (this.clientA, this.clientB) : (this.clientB, this.clientA);
 
         using var drainResponse = await drainingClient.PostAsync("/drain", content: null);
@@ -92,7 +94,8 @@ internal sealed class TwoInstanceApiTests
         await this.waitUntilAsync(async () =>
         {
             var diagnostics = await getDiagnosticsAsync(survivingClient);
-            return JobNames.All(jobName => diagnostics.Jobs.SingleOrDefault(j => j.Name == jobName)?.IsRunningHere == true);
+            return WorkloadKeys.All(workloadKey =>
+                diagnostics.Workloads.SingleOrDefault(w => w.WorkloadKey == workloadKey)?.OwnerInstanceId == diagnostics.InstanceId);
         });
     }
 
@@ -104,16 +107,17 @@ internal sealed class TwoInstanceApiTests
         return diagnostics ?? throw new InvalidOperationException("/diagnostics returned an empty body.");
     }
 
-    private static async Task<bool> isOwnerAsync(HttpClient client, string jobName)
+    private static async Task<bool> isOwnerAsync(HttpClient client, string workloadKey)
     {
         var diagnostics = await getDiagnosticsAsync(client);
-        return diagnostics.Jobs.SingleOrDefault(j => j.Name == jobName)?.IsRunningHere ?? false;
+        var owner = diagnostics.Workloads.SingleOrDefault(w => w.WorkloadKey == workloadKey)?.OwnerInstanceId;
+        return owner == diagnostics.InstanceId;
     }
 
-    private async Task<int> countOwnersAsync(string jobName)
+    private async Task<int> countOwnersAsync(string workloadKey)
     {
-        var ownsOnA = await isOwnerAsync(this.clientA, jobName);
-        var ownsOnB = await isOwnerAsync(this.clientB, jobName);
+        var ownsOnA = await isOwnerAsync(this.clientA, workloadKey);
+        var ownsOnB = await isOwnerAsync(this.clientB, workloadKey);
         return (ownsOnA ? 1 : 0) + (ownsOnB ? 1 : 0);
     }
 
@@ -144,20 +148,20 @@ internal sealed class TwoInstanceApiTests
         [JsonPropertyName("isDraining")]
         public bool IsDraining { get; set; }
 
-        [JsonPropertyName("jobs")]
-        public List<JobSnapshotDto> Jobs { get; set; } = new ();
+        [JsonPropertyName("workloads")]
+        public List<WorkloadStatusDto> Workloads { get; set; } = new ();
     }
 
-    private sealed class JobSnapshotDto
+    private sealed class WorkloadStatusDto
     {
-        [JsonPropertyName("name")]
-        public string Name { get; set; } = string.Empty;
+        [JsonPropertyName("workloadKey")]
+        public string WorkloadKey { get; set; } = string.Empty;
 
-        [JsonPropertyName("isRunningHere")]
-        public bool IsRunningHere { get; set; }
+        [JsonPropertyName("status")]
+        public string Status { get; set; } = string.Empty;
 
-        [JsonPropertyName("tickCount")]
-        public long TickCount { get; set; }
+        [JsonPropertyName("ownerInstanceId")]
+        public string OwnerInstanceId { get; set; } = string.Empty;
     }
 
     /// <summary>
