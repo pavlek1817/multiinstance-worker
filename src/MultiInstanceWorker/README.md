@@ -4,9 +4,10 @@ Provider-agnostic building blocks for running background workers across multiple
 instances of an application: leader election for singleton workloads, instance
 discovery, and even splitting of a set of named workloads across live instances.
 
-This library defines the coordination *logic* and the storage *contracts* it needs.
-It does not ship a Redis, SQL, or any other backing-store implementation — a
-consuming application supplies that by implementing three small interfaces.
+This library defines the coordination *logic*; the storage *contracts* it needs live in
+`MultiInstanceWorker.Abstractions` (referenced automatically). It ships no backing-store
+implementation itself — add the `MultiInstanceWorker.Redis` package for a ready-made Redis
+one, or implement three small interfaces against your own store.
 
 ## Pieces
 
@@ -77,7 +78,7 @@ consuming application supplies that by implementing three small interfaces.
   `AddWorkloadCoordinator` defaults `IWorkloadAssigner` to `BalancedNamedWorkloadAssigner`)
   via `TryAdd`, so a consumer's own registration always wins if they need something else.
   `ILeaseManager`, `IInstanceRegistry`, and `IWorkloadStatusStore` are never defaulted —
-  register those against your own store before calling either extension.
+  register those with a provider package (`AddMultiInstanceWorkerRedis`) or against your own store.
 
 ## Draining an instance
 
@@ -94,9 +95,18 @@ assignments until its heartbeat naturally expires.
 ## Usage sketch
 
 ```csharp
-services.AddSingleton<ILeaseManager, YourLeaseManager>();             // your store adapter
-services.AddSingleton<IInstanceRegistry, YourInstanceRegistry>();     // your store adapter
-services.AddSingleton<IWorkloadStatusStore, YourWorkloadStatusStore>(); // your store adapter
+// The backing store: the MultiInstanceWorker.Redis package...
+services.AddMultiInstanceWorkerRedis(options =>
+{
+    options.ConnectionString = "localhost:6379";
+    options.KeyPrefix = "my-app";
+    options.InstanceHeartbeatTtl = TimeSpan.FromSeconds(15); // same value as your InstanceHeartbeatTtlMs
+});
+
+// ...or your own adapters, for any other store:
+// services.AddSingleton<ILeaseManager, YourLeaseManager>();
+// services.AddSingleton<IInstanceRegistry, YourInstanceRegistry>();
+// services.AddSingleton<IWorkloadStatusStore, YourWorkloadStatusStore>();
 
 services.AddLeasedWorker(
     workloadKey: "singleton:some-background-job",
@@ -134,12 +144,13 @@ Constructing `LeasedWorkerHostedService`/`WorkloadCoordinatorHostedService<TWork
 (as `AddLeasedWorker`/`AddWorkloadCoordinator<TWorkload>` do internally) still works if you need
 finer control than the extensions give you.
 
-## Why no `MultiInstanceWorker.Redis` package (yet)
+## Backing-store providers
 
 This package stays free of any specific backing-store dependency (no StackExchange.Redis, no SQL
-driver) - you supply `ILeaseManager`, `IInstanceRegistry`, and `IWorkloadStatusStore` against
-whatever store you already use. The project repository's sample app includes a real, tested Redis
-implementation of all three you can use as a starting point.
+driver). `ILeaseManager`, `IInstanceRegistry`, and `IWorkloadStatusStore` come from a separate
+provider package - `MultiInstanceWorker.Redis` today - or from your own implementation against
+whatever store you already use. Providers reference only `MultiInstanceWorker.Abstractions`, never
+this package.
 
 ## More
 

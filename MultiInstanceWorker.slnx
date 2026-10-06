@@ -1,6 +1,8 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/MultiInstanceWorker/MultiInstanceWorker.csproj" />
+    <Project Path="src/MultiInstanceWorker.Abstractions/MultiInstanceWorker.Abstractions.csproj" />
+    <Project Path="src/MultiInstanceWorker.Redis/MultiInstanceWorker.Redis.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/MultiInstanceWorker.Sample.Api/MultiInstanceWorker.Sample.Api.csproj" />

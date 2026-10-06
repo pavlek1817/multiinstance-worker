@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <PackageId>MultiInstanceWorker.Redis</PackageId>
+        <Description>Redis (StackExchange.Redis) provider for MultiInstanceWorker: ready-made ILeaseManager, IInstanceRegistry, and IWorkloadStatusStore implementations, registered with a single AddMultiInstanceWorkerRedis call.</Description>
+        <PackageTags>multiinstance;background-service;leader-election;distributed-systems;redis;stackexchange-redis;dotnet</PackageTags>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
+        <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.11" />
+        <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.11" />
+        <PackageReference Include="StackExchange.Redis" Version="3.1.31" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- Deliberately Abstractions only, never the engine package: this provider and the engine
+             share contracts, not code. -->
+        <ProjectReference Include="..\MultiInstanceWorker.Abstractions\MultiInstanceWorker.Abstractions.csproj" />
+    </ItemGroup>
+
+</Project>

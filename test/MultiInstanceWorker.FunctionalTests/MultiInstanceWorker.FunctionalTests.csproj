@@ -34,6 +34,7 @@
     <ItemGroup>
         <ProjectReference Include="..\..\samples\MultiInstanceWorker.Sample.Api\MultiInstanceWorker.Sample.Api.csproj" />
         <ProjectReference Include="..\..\src\MultiInstanceWorker\MultiInstanceWorker.csproj" />
+        <ProjectReference Include="..\..\src\MultiInstanceWorker.Redis\MultiInstanceWorker.Redis.csproj" />
     </ItemGroup>
 
 </Project>

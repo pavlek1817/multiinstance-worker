@@ -1,7 +1,7 @@
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
-namespace MultiInstanceWorker.Sample.Api.Redis;
+namespace MultiInstanceWorker.Redis;
 
 /// <summary>
 /// A Redis-backed <see cref="IInstanceRegistry"/>. Heartbeats live in a sorted set keyed by
@@ -11,24 +11,24 @@ namespace MultiInstanceWorker.Sample.Api.Redis;
 /// heartbeat score itself is overwritten on every renewal and so can't double as a join time.
 /// </summary>
 /// <remarks>
-/// Same rationale as <see cref="RedisLeaseManager"/>: a real, StackExchange.Redis-backed adapter
-/// that lives in this sample app, not in the core package.
+/// The heartbeat TTL comes from <see cref="RedisWorkerOptions.InstanceHeartbeatTtl"/> rather than
+/// the engine package's <c>LeaderElectionConfig</c>, so this package depends only on the shared
+/// contracts and never on the engine itself.
 /// </remarks>
 public sealed class RedisInstanceRegistry : IInstanceRegistry
 {
     private readonly IConnectionMultiplexer connectionMultiplexer;
-    private readonly RedisOptions options;
+    private readonly RedisWorkerOptions options;
     private readonly TimeSpan heartbeatTtl;
 
     public RedisInstanceRegistry(
         IConnectionMultiplexer connectionMultiplexer,
-        IOptions<RedisOptions> options,
-        IInstanceIdentityProvider instanceIdentityProvider,
-        IOptions<LeaderElectionConfig> timingOptions)
+        IOptions<RedisWorkerOptions> options,
+        IInstanceIdentityProvider instanceIdentityProvider)
     {
         this.connectionMultiplexer = connectionMultiplexer;
         this.options = options.Value;
-        this.heartbeatTtl = TimeSpan.FromMilliseconds(timingOptions.Value.InstanceHeartbeatTtlMs);
+        this.heartbeatTtl = this.options.InstanceHeartbeatTtl;
         this.InstanceId = instanceIdentityProvider.InstanceId;
     }
 

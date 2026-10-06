@@ -1,20 +1,18 @@
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
-namespace MultiInstanceWorker.Sample.Api.Redis;
+namespace MultiInstanceWorker.Redis;
 
 /// <summary>
 /// A Redis-backed <see cref="ILeaseManager"/>. Every named workload becomes a single string key
 /// holding the owning instance id, with a Redis key expiry (<c>PX</c>) as the lease TTL.
 /// </summary>
 /// <remarks>
-/// This is the kind of adapter the core <c>MultiInstanceWorker</c> package deliberately does not
-/// ship: it depends on StackExchange.Redis directly, which is why it lives here in the sample
-/// application rather than in the reusable library. Acquire/renew and release are each a single
-/// Lua script, so the read-then-write is atomic on the Redis side without a separate arbitration
-/// lock, as <see cref="ILeaseManager"/>'s contract requires.
+/// Acquire/renew and release are each a single Lua script, so the read-then-write is atomic on the
+/// Redis side without a separate arbitration lock, as <see cref="ILeaseManager"/>'s contract
+/// requires.
 /// </remarks>
-public sealed class RedisLeaseManager(IConnectionMultiplexer connectionMultiplexer, IOptions<RedisOptions> options)
+public sealed class RedisLeaseManager(IConnectionMultiplexer connectionMultiplexer, IOptions<RedisWorkerOptions> options)
     : ILeaseManager
 {
     // KEYS[1] = lease key, ARGV[1] = owner id, ARGV[2] = ttl in milliseconds.
@@ -41,7 +39,7 @@ public sealed class RedisLeaseManager(IConnectionMultiplexer connectionMultiplex
         return 0
         """);
 
-    private readonly RedisOptions options = options.Value;
+    private readonly RedisWorkerOptions options = options.Value;
 
     public async Task<bool> TryAcquireOrRenewAsync(string leaseName, string ownerId, TimeSpan leaseTtl, CancellationToken ct)
     {

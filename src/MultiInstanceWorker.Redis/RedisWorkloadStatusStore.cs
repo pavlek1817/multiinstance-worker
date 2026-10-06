@@ -1,7 +1,7 @@
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
-namespace MultiInstanceWorker.Sample.Api.Redis;
+namespace MultiInstanceWorker.Redis;
 
 /// <summary>
 /// A Redis-backed <see cref="IWorkloadStatusStore"/>. Each workload becomes a Redis hash (status,
@@ -12,11 +12,7 @@ namespace MultiInstanceWorker.Sample.Api.Redis;
 /// live workload without already knowing their keys, mirroring how <see cref="RedisInstanceRegistry"/>
 /// indexes live instances rather than scanning key patterns.
 /// </summary>
-/// <remarks>
-/// Same rationale as the other Redis adapters in this sample: kept out of the core package because
-/// it depends on StackExchange.Redis directly.
-/// </remarks>
-public sealed class RedisWorkloadStatusStore(IConnectionMultiplexer connectionMultiplexer, IOptions<RedisOptions> options)
+public sealed class RedisWorkloadStatusStore(IConnectionMultiplexer connectionMultiplexer, IOptions<RedisWorkerOptions> options)
     : IWorkloadStatusStore
 {
     // KEYS[1] = status hash key, KEYS[2] = index key.
@@ -33,7 +29,7 @@ public sealed class RedisWorkloadStatusStore(IConnectionMultiplexer connectionMu
         return 1
         """);
 
-    private readonly RedisOptions options = options.Value;
+    private readonly RedisWorkerOptions options = options.Value;
 
     private RedisKey indexKey => $"{this.options.KeyPrefix}:workload-status:index";
 
