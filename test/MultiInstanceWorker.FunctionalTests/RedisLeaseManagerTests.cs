@@ -1,6 +1,6 @@
 using FluentAssertions;
 using Microsoft.Extensions.Options;
-using MultiInstanceWorker.Sample.Api.Redis;
+using MultiInstanceWorker.Redis;
 using StackExchange.Redis;
 
 namespace MultiInstanceWorker.FunctionalTests;
@@ -24,7 +24,7 @@ internal sealed class RedisLeaseManagerTests
         this.connectionMultiplexer = ConnectionMultiplexer.Connect(RedisTestFixture.ConnectionString);
         this.leaseManager = new RedisLeaseManager(
             this.connectionMultiplexer,
-            Options.Create(new RedisOptions { KeyPrefix = $"test-{Guid.NewGuid():N}" }));
+            Options.Create(new RedisWorkerOptions { KeyPrefix = $"test-{Guid.NewGuid():N}" }));
     }
 
     [TearDown]

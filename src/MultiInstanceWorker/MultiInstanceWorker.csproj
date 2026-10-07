@@ -1,35 +1,19 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>net10.0</TargetFramework>
-        <LangVersion>latest</LangVersion>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
-        <IsPackable>true</IsPackable>
         <PackageId>MultiInstanceWorker</PackageId>
-        <Version>3.0.0</Version>
-        <Authors>Mario Pavlović</Authors>
-        <Company>PavMa</Company>
         <Description>Library for handling background workers in a multi-instance environment, handling autoscaling: provider-agnostic leader election, instance discovery, and balanced workload assignment for running singleton and sharded background workers across multiple application instances.</Description>
         <PackageTags>multiinstance;background-service;leader-election;autoscaling;distributed-systems;workload-coordination;hosted-service;dotnet</PackageTags>
-        <PackageReadmeFile>README.md</PackageReadmeFile>
-        <PackageLicenseExpression>MIT</PackageLicenseExpression>
-        <RepositoryUrl>https://github.com/pavlek1817/multiinstance-worker</RepositoryUrl>
-        <RepositoryType>git</RepositoryType>
     </PropertyGroup>
 
     <ItemGroup>
       <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
       <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.11" />
       <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
-      <PackageReference Include="StyleCop.Analyzers" Version="1.1.118">
-        <PrivateAssets>all</PrivateAssets>
-        <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-      </PackageReference>
     </ItemGroup>
 
     <ItemGroup>
-      <None Include="README.md" Pack="true" PackagePath="\" />
+      <ProjectReference Include="..\MultiInstanceWorker.Abstractions\MultiInstanceWorker.Abstractions.csproj" />
     </ItemGroup>
 
     <ItemGroup>

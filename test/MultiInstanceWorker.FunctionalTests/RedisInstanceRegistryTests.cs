@@ -1,6 +1,6 @@
 using FluentAssertions;
 using Microsoft.Extensions.Options;
-using MultiInstanceWorker.Sample.Api.Redis;
+using MultiInstanceWorker.Redis;
 using StackExchange.Redis;
 
 namespace MultiInstanceWorker.FunctionalTests;
@@ -9,13 +9,13 @@ namespace MultiInstanceWorker.FunctionalTests;
 internal sealed class RedisInstanceRegistryTests
 {
     private IConnectionMultiplexer connectionMultiplexer = null!;
-    private RedisOptions options = null!;
+    private string keyPrefix = null!;
 
     [SetUp]
     public void SetUp()
     {
         this.connectionMultiplexer = ConnectionMultiplexer.Connect(RedisTestFixture.ConnectionString);
-        this.options = new RedisOptions { KeyPrefix = $"test-{Guid.NewGuid():N}" };
+        this.keyPrefix = $"test-{Guid.NewGuid():N}";
     }
 
     [TearDown]
@@ -127,9 +127,8 @@ internal sealed class RedisInstanceRegistryTests
 
     private RedisInstanceRegistry buildRegistry(string instanceId, TimeSpan heartbeatTtl) => new (
         this.connectionMultiplexer,
-        Options.Create(this.options),
-        new FixedInstanceIdentityProvider(instanceId),
-        Options.Create(new LeaderElectionConfig { InstanceHeartbeatTtlMs = (int)heartbeatTtl.TotalMilliseconds }));
+        Options.Create(new RedisWorkerOptions { KeyPrefix = this.keyPrefix, InstanceHeartbeatTtl = heartbeatTtl }),
+        new FixedInstanceIdentityProvider(instanceId));
 
     private sealed class FixedInstanceIdentityProvider(string instanceId)
         : IInstanceIdentityProvider

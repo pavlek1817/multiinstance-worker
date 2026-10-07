@@ -7,7 +7,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
-using MultiInstanceWorker.Sample.Api.Redis;
+using MultiInstanceWorker.Redis;
 using StackExchange.Redis;
 
 namespace MultiInstanceWorker.FunctionalTests;
@@ -54,7 +54,7 @@ internal sealed class WorkloadHandoverApiTests
         // outside the app.
         this.statusStore = new RedisWorkloadStatusStore(
             this.connectionMultiplexer,
-            Options.Create(new RedisOptions { KeyPrefix = this.keyPrefix }));
+            Options.Create(new RedisWorkerOptions { KeyPrefix = this.keyPrefix }));
     }
 
     [TearDown]

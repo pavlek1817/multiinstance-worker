@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <PackageId>MultiInstanceWorker.Abstractions</PackageId>
+        <!-- Same namespace as the engine package, so moving these types here was source-compatible
+             for every existing consumer. -->
+        <RootNamespace>MultiInstanceWorker</RootNamespace>
+        <Description>Contracts for MultiInstanceWorker: the storage interfaces (ILeaseManager, IInstanceRegistry, IWorkloadStatusStore) and the types they exchange. Dependency-free, so a backing-store provider can implement them without referencing the engine package.</Description>
+        <PackageTags>multiinstance;background-service;leader-election;distributed-systems;abstractions;dotnet</PackageTags>
+    </PropertyGroup>
+
+</Project>

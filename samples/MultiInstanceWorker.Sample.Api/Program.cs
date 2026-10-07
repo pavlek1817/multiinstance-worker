@@ -1,20 +1,15 @@
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using MultiInstanceWorker;
+using MultiInstanceWorker.Redis;
 using MultiInstanceWorker.Sample.Api.Diagnostics;
 using MultiInstanceWorker.Sample.Api.Jobs;
-using MultiInstanceWorker.Sample.Api.Redis;
-using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Enums (WorkloadStatus, in /diagnostics) as strings rather than numbers - readable without the
 // caller having to know the enum's underlying values.
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
-
-builder.Services
-    .AddOptions<RedisOptions>()
-    .Bind(builder.Configuration.GetSection(RedisOptions.SectionName));
 
 builder.Services
     .AddOptions<LeaderElectionConfig>()
@@ -27,19 +22,20 @@ builder.Services
         },
         "Invalid WorkerTiming configuration.");
 
-builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
-{
-    var redisOptions = sp.GetRequiredService<IOptions<RedisOptions>>().Value;
-    return ConnectionMultiplexer.Connect(redisOptions.ConnectionString);
-});
+// The core package is provider-agnostic - it does not know about Redis. MultiInstanceWorker.Redis
+// supplies the ILeaseManager/IInstanceRegistry/IWorkloadStatusStore it needs, connecting with the
+// "Redis" section's ConnectionString. (IInstanceIdentityProvider isn't registered here:
+// AddWorkloadCoordinator below defaults it to the stock ProcessInstanceIdentityProvider via TryAdd,
+// and nothing in this sample needs a custom one.)
+builder.Services.AddMultiInstanceWorkerRedis(builder.Configuration.GetSection(RedisWorkerOptions.SectionName));
 
-// The core package is provider-agnostic - it does not know about Redis. These three adapters are
-// what a consuming application supplies itself, per the README. (IInstanceIdentityProvider isn't
-// listed here: AddWorkloadCoordinator below defaults it to the stock ProcessInstanceIdentityProvider
-// via TryAdd, and nothing in this sample needs a custom one.)
-builder.Services.AddSingleton<ILeaseManager, RedisLeaseManager>();
-builder.Services.AddSingleton<IInstanceRegistry, RedisInstanceRegistry>();
-builder.Services.AddSingleton<IWorkloadStatusStore, RedisWorkloadStatusStore>();
+// The Redis package doesn't know LeaderElectionConfig (it shares only contracts with the core
+// package), so the heartbeat TTL its instance registry expires instances by is handed over here,
+// from the same WorkerTiming section the coordinators below are timed by - one source, no drift.
+builder.Services
+    .AddOptions<RedisWorkerOptions>()
+    .Configure<IOptions<LeaderElectionConfig>>((redis, timing) =>
+        redis.InstanceHeartbeatTtl = TimeSpan.FromMilliseconds(timing.Value.InstanceHeartbeatTtlMs));
 
 // One SampleWorkerJob per catalog entry, reused for the app's lifetime: each is both the workload
 // (executeAsync) and the coordinator's cooperative drain target (drainable) for its job, so
